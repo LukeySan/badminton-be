@@ -1,9 +1,0 @@
-# Worker deps (the conda env `badminton` already has these).
-# Also needs the ffmpeg binary on PATH (conda install -c conda-forge ffmpeg).
-torch
-opencv-python
-numpy
-pandas
-tqdm
-parse
-pillow

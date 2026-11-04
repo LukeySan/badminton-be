@@ -1,0 +1,47 @@
+# Local services only. The API and worker run directly on the machine (uv), not in
+# Docker: on a Mac, Docker can't reach the Apple GPU that shuttle tracking needs.
+#
+#   docker compose up -d        start
+#   docker compose down         stop (data is kept in the app-db-data volume)
+#   docker compose down -v      stop and DELETE the database
+services:
+
+  db:
+    image: postgres:18
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 10s
+      retries: 5
+      start_period: 30s
+      timeout: 10s
+    ports:
+      # 5433 on the host so it doesn't clash with a Postgres installed on the Mac (5432)
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - app-db-data:/var/lib/postgresql
+      # Runs once, when the volume is first created: makes the app_test database
+      - ./scripts/initdb:/docker-entrypoint-initdb.d:ro
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:?Variable not set}
+      - POSTGRES_DB=app
+
+  # Database browser: http://localhost:8080 (System: PostgreSQL, Server: db,
+  # Username: postgres, Password: POSTGRES_PASSWORD from .env, Database: app)
+  adminer:
+    image: adminer
+    depends_on:
+      - db
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMINER_DESIGN=pepa-linha-dark
+
+  # Catches emails (password reset) locally: http://localhost:8025
+  mailpit:
+    image: axllent/mailpit
+    ports:
+      - "8025:8025"
+      - "1025:1025"
+
+volumes:
+  app-db-data:

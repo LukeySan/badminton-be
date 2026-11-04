@@ -1,0 +1,6 @@
+# uv workspace: one lockfile and one .venv for both parts of the repo.
+#   backend/  the API ("app" package, from full-stack-fastapi-template)
+#   worker/   video processing (TrackNet + rally detection); holds the heavy deps
+#             (torch, opencv) so the API doesn't need them
+[tool.uv.workspace]
+members = ["backend", "worker"]
