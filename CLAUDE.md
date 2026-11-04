@@ -1,4 +1,4 @@
-# Badminton Rally Analyzer — app repo (beta prototype)
+# Badminton Rally Analyzer — backend repo (beta prototype)
 
 Read this first. It describes what we're building, the decisions already made, and
 the milestones in order. Background research lives in `../badminton-test/`
@@ -44,7 +44,7 @@ Dev machine: macOS, Apple Silicon, conda env `badminton`
 ## Repo layout (target)
 
 ```
-badminton-app/      (backend repo)
+badminton-backend/      (backend repo)
   CLAUDE.md
   backend/          FastAPI app (app/main.py, db.py, models, routes)
   worker/           pipeline + job loop

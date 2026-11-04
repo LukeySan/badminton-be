@@ -34,7 +34,7 @@ You need [conda](https://docs.conda.io/en/latest/miniconda.html) (Miniconda is e
 conda create -n badminton python=3.11 -y
 conda activate badminton
 conda install -c conda-forge ffmpeg -y
-cd badminton-app
+cd badminton-backend
 python -m pip install -r backend/requirements.txt -r worker/requirements.txt
 ```
 
@@ -58,7 +58,7 @@ still active: run `deactivate`, or open a fresh terminal, and activate again.
 
 ## Run the API
 
-From the `badminton-app/` folder:
+From the `badminton-backend/` folder:
 
 ```bash
 conda activate badminton
