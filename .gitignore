@@ -1,7 +1,8 @@
+# Secrets: commit .env.example, never .env
+.env
+
 # Large / private data — never commit
 storage/
-data/
-*.db
 *.mp4
 *.mov
 *.MOV
@@ -16,6 +17,10 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # OS / editors
 .DS_Store
