@@ -1,0 +1,4 @@
+# API deps. Also needs ffmpeg/ffprobe on PATH (conda install -c conda-forge ffmpeg).
+fastapi>=0.115
+uvicorn[standard]
+python-multipart
