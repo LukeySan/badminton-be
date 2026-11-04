@@ -1,6 +1,7 @@
+from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Fraction01 = Annotated[float, Field(ge=0, le=1)]
 Point = tuple[Fraction01, Fraction01]
@@ -29,6 +30,8 @@ class Court(BaseModel):
 
 
 class VideoOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)  # build from ORM objects
+
     id: str
     filename: str
     status: Status
@@ -39,11 +42,13 @@ class VideoOut(BaseModel):
     width: int | None
     height: int | None
     court_corners: list[Point] | None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
 
 class RallyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     start: float
     end: float

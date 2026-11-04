@@ -24,7 +24,7 @@ camera behind the baseline, as high as possible.
 | Styling | Tailwind | |
 | Mobile (later) | Capacitor | Wraps the Vite `dist/` build for iOS/Android |
 | API | **FastAPI** (Python 3.11) | |
-| DB (beta) | **SQLite** | One file shared by API and worker. Supabase Postgres later. |
+| DB (beta) | **SQLite** via **SQLAlchemy 2.0 ORM** | One file shared by API and worker. Supabase Postgres later. No raw SQL strings (developer preference); status changes use ORM `update(...).where(status.in_(...))` so check+write is atomic. |
 | Storage (beta) | Local folder `storage/` | Supabase Storage later |
 | Processing | Python worker: TrackNetV3 (fast mode) + rule-based rally detection | Runs on the Mac (MPS) or the RTX 2070 Super PC (CUDA) |
 
