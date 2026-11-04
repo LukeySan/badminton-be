@@ -31,10 +31,20 @@ camera behind the baseline, as high as possible.
 Dev machine: macOS, Apple Silicon, conda env `badminton`
 (`conda activate badminton`; use `python` and `python -m pip`, not `python3`/`pip`).
 
+## Repos (decided: two separate GitHub repos)
+
+- **This repo = backend**: API + worker. They stay together because the worker shares
+  the ORM models/db code (`backend/app/models.py`, `db.py`) with the API.
+- **Frontend = its own repo** (Vite React app, later Capacitor). Not in this folder; don't
+  create `frontend/` here. It should generate its API types from FastAPI's schema
+  (`npx openapi-typescript http://localhost:8000/openapi.json -o src/api/types.ts`)
+  instead of hand-writing them, so contract changes show up as TS errors.
+- Keep the README here backend-only.
+
 ## Repo layout (target)
 
 ```
-badminton-app/
+badminton-app/      (backend repo)
   CLAUDE.md
   backend/          FastAPI app (app/main.py, db.py, models, routes)
   worker/           pipeline + job loop
@@ -43,7 +53,6 @@ badminton-app/
     rally_detect.py copied from research, rule_detect() is the detector
     pipeline.py     process_video(...)
     run_worker.py   polls DB for queued jobs
-  frontend/         Vite React app
   storage/          uploaded videos + per-video outputs (gitignored)
   data/app.db       SQLite (gitignored)
 ```
@@ -130,8 +139,8 @@ local original file; edit rally boundaries → corrections; highlight export.
 3. **Worker loop** polling the DB, updating status/progress, saving rallies, handling
    failures (status `failed` + error message). Done when upload → process → rallies works
    end to end.
-4. **Frontend: upload + mark court + processing** screens.
-5. **Frontend: player** with chapter scrubber and rally list. ← demo milestone
+4. **Frontend: upload + mark court + processing** screens (in the frontend repo).
+5. **Frontend: player** with chapter scrubber and rally list (frontend repo). ← demo milestone
 6. Then: tests, README, run script (`make dev` or similar), corrections table.
 
 ## Conventions

@@ -1,14 +1,16 @@
-# Badminton Rally Analyzer
+# Badminton Rally Analyzer: backend
 
-Record a badminton match on a phone, upload it, and get every **rally** (start/end time)
-back as chapters you can jump between: skip the dead time between points.
+The API and video-processing worker for the Badminton Rally Analyzer. A player uploads
+a match video and gets back every **rally** (start/end time), which the app shows as
+chapters to jump between. The web/mobile app lives in a separate repo and talks to this
+one over HTTP.
 
-Under the hood: [TrackNetV3](https://github.com/qaz812345/TrackNetV3) finds the shuttle
-in every frame, then rule-based detection groups "shuttle moving over your court" into
-rallies.
+How rallies are found: [TrackNetV3](https://github.com/qaz812345/TrackNetV3) locates the
+shuttle in every frame, then rule-based detection groups "shuttle moving over your court"
+into rallies.
 
-> **Status: beta prototype.** Working: the processing pipeline (CLI) and the API.
-> Not yet: the background worker (videos stay `queued`), the web app.
+> **Status: beta prototype.** Working: the API and the processing pipeline (CLI).
+> Not yet: the background worker loop, so uploaded videos stay `queued`.
 
 ## Repo layout
 
@@ -17,10 +19,12 @@ backend/    FastAPI API (SQLite via SQLAlchemy, local file storage)
 worker/     processing pipeline: downscale → TrackNet shuttle tracking → rally detection
   tracknet/   TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/      model weights (not in git, see below)
-frontend/   React web app (coming)
 storage/    uploaded videos (created on first run, not in git)
 data/       app.db SQLite database (created on first run, not in git)
 ```
+
+The API and worker share one repo because they share the database models
+(`backend/app/models.py`).
 
 ## Setup (macOS, once)
 
@@ -119,7 +123,15 @@ rallies.json) to `worker/output/<video name>/`. Use `--batch-size 16` on an NVID
 | `BADMINTON_STORAGE` | `storage/` | Where uploaded videos go |
 | `BADMINTON_DB` | `data/app.db` | SQLite database file |
 
-The API allows the Vite dev server (`http://localhost:5173`) via CORS.
+## Using it from the frontend
+
+- CORS allows the frontend's Vite dev server (`http://localhost:5173`); edit
+  `CORS_ORIGINS` in `backend/app/config.py` for other origins.
+- The API schema is at `http://localhost:8000/openapi.json`. Generate TypeScript types
+  from it in the frontend repo rather than writing them by hand:
+  `npx openapi-typescript http://localhost:8000/openapi.json -o src/api/types.ts`
+- All times are seconds (float). All court coordinates are fractions 0-1 of the video's
+  displayed width/height (`width`/`height` in `GET /videos/{id}`).
 
 ## Recording tips for good results
 

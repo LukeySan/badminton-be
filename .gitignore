@@ -17,10 +17,6 @@ __pycache__/
 .venv/
 .pytest_cache/
 
-# Node
-node_modules/
-dist/
-
 # OS / editors
 .DS_Store
 .vscode/
