@@ -195,8 +195,8 @@ Intermediate files go to `storage/<video id>/work/`.
 
 ## Run the pipeline directly (no API)
 
-Useful for testing detection on one video. Takes about 0.5–1× the video's length on an
-Apple Silicon Mac.
+Useful for testing detection on one video. Takes about half the video's length on an
+Apple Silicon Mac (7-min match: 3.7 min; 21-min match: 10.6 min).
 
 ```bash
 uv run --package worker python worker/pipeline.py ../badminton-test/match4_720.mp4 \
@@ -205,6 +205,22 @@ uv run --package worker python worker/pipeline.py ../badminton-test/match4_720.m
 
 It prints the rallies and writes intermediate files (720p video, shuttle CSV, court.json,
 rallies.json) to `worker/output/<video name>/`. Use `--batch-size 16` on an NVIDIA GPU.
+
+**Where the time goes** (match 4, 7.1 min of 720p video, M-series Mac):
+
+| Phase | Time |
+|---|---|
+| Count frames | 3 s |
+| Background (median) image | 10 s |
+| Model load | < 1 s |
+| Shuttle tracking | ~210 s |
+| Rally detection | < 0.1 s |
+
+The background image is the median of 300 frames, read front to back
+(`MEDIAN_SAMPLES` in `worker/tracknet/infer.py`). TrackNet's own version seeks to
+~1800 frames and took 124 s and 15 GB of memory for the same video, with no
+accuracy benefit: same score on match 4, and 72 of 73 rallies unchanged on match 5.
+Below ~150 frames, accuracy started to drop.
 
 ## Configuration
 
