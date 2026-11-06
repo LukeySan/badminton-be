@@ -70,8 +70,10 @@ def process_video(video_path, corners, work_dir, ckpt_path=DEFAULT_CKPT, batch_s
                   on_progress=None, log=print):
     """Find rallies in video_path. corners: 4 (x, y) fractions. Returns [{start, end, duration}] in seconds.
     on_progress(fraction 0-1) is called during tracking, the slow step."""
-    if len(corners) != 4 or not all(0 <= v <= 1 for c in corners for v in c):
-        raise ValueError("corners must be 4 (x, y) pairs with values between 0 and 1")
+    # Same limits as the API (app.models.COURT_MARGIN_MAX): corners may be off-screen
+    # by up to 30% of the frame; pixel coordinates are then negative or past the edge.
+    if len(corners) != 4 or not all(-0.3 <= v <= 1.3 for c in corners for v in c):
+        raise ValueError("corners must be 4 (x, y) pairs with values between -0.3 and 1.3")
     os.makedirs(work_dir, exist_ok=True)
 
     t0 = time.time()

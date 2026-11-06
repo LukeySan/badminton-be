@@ -59,7 +59,9 @@ def upload(
 ) -> httpx.Response:
     with open(path, "rb") as f:
         return client.post(
-            f"{API}/", headers=headers, files={"file": (name or path.name, f, "video/mp4")}
+            f"{API}/",
+            headers=headers,
+            files={"file": (name or path.name, f, "video/mp4")},
         )
 
 
@@ -190,7 +192,19 @@ def test_superuser_can_read_any_video(
     ("corners", "message"),
     [
         ([[0.1, 0.3], [0.9, 0.3], [0.9, 0.9]], "at least 4"),
-        ([[0.1, 0.3], [0.9, 0.3], [1.2, 0.9], [0.1, 0.9]], "less than or equal to 1"),
+        # more than 30% outside the frame: a mis-tap, not a court
+        (
+            [[0.1, 0.3], [0.9, 0.3], [1.31, 0.9], [0.1, 0.9]],
+            "less than or equal to 1.3",
+        ),
+        (
+            [[0.1, 0.3], [0.9, 0.3], [0.9, 0.9], [-0.31, 0.9]],
+            "greater than or equal to -0.3",
+        ),
+        (
+            [[0.1, -0.5], [0.9, 0.3], [0.9, 0.9], [0.1, 0.9]],
+            "greater than or equal to -0.3",
+        ),
         ([[0.1, 0.9], [0.9, 0.9], [0.9, 0.3], [0.1, 0.3]], "far corners must be above"),
         ([[0.9, 0.3], [0.1, 0.3], [0.9, 0.9], [0.1, 0.9]], "left corners must be left"),
     ],
@@ -209,6 +223,46 @@ def test_court_validation(
     )
     assert r.status_code == 422
     assert message in r.text
+
+
+@pytest.mark.parametrize(
+    ("corners", "out_of_frame"),
+    [
+        # inside the frame
+        (COURT["corners"], False),
+        # match 5: near corners slightly off-screen; within 10%, no warning
+        ([[0.382, 0.561], [0.673, 0.561], [1.043, 0.935], [-0.023, 0.903]], False),
+        # exactly on the no-warning limits
+        ([[0.3, -0.1], [0.7, -0.1], [1.1, 0.9], [-0.1, 0.9]], False),
+        # just past them: accepted, with the warning
+        ([[0.3, 0.3], [0.7, 0.3], [1.11, 0.9], [0.1, 0.9]], True),
+        ([[0.3, 0.3], [0.7, 0.3], [0.9, 1.11], [0.1, 0.9]], True),
+        # exactly on the hard limits: still accepted
+        ([[0.3, -0.3], [0.7, -0.3], [1.3, 1.3], [-0.3, 1.3]], True),
+    ],
+)
+def test_court_partly_outside_the_frame(
+    client: TestClient,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+    corners: list[list[float]],
+    out_of_frame: bool,
+) -> None:
+    url = f"{API}/{video['id']}"
+    r = client.put(
+        f"{url}/court", headers=normal_user_token_headers, json={"corners": corners}
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["court_corners"] == corners
+    assert r.json()["court_out_of_frame"] is out_of_frame
+    # also on every later read, so the app can show it on any screen
+    r = client.get(url, headers=normal_user_token_headers)
+    assert r.json()["court_out_of_frame"] is out_of_frame
+
+
+def test_no_court_means_no_warning(video: dict[str, Any]) -> None:
+    assert video["court_corners"] is None
+    assert video["court_out_of_frame"] is False
 
 
 def test_court_and_process_flow(
@@ -294,7 +348,12 @@ def test_rallies_sorted_with_duration(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     vid = uuid.UUID(video["id"])
-    db.add_all([Rally(video_id=vid, start=20.5, end=31.0), Rally(video_id=vid, start=3.0, end=9.25)])
+    db.add_all(
+        [
+            Rally(video_id=vid, start=20.5, end=31.0),
+            Rally(video_id=vid, start=3.0, end=9.25),
+        ]
+    )
     db.commit()
 
     r = client.get(f"{API}/{video['id']}/rallies", headers=normal_user_token_headers)

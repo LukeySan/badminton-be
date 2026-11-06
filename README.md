@@ -104,9 +104,9 @@ own videos; the superuser sees all.
 |---|---|
 | `POST /videos/` | Upload a video (multipart, field `file`) |
 | `GET /videos/` | Your videos, newest first: `{data, count}` |
-| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court |
+| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning |
 | `GET /videos/{id}/frame?t=1` | JPEG frame for marking the court |
-| `PUT /videos/{id}/court` | 4 court corners as fractions 0-1, order far-left, far-right, near-right, near-left. Not allowed while queued/processing. |
+| `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
 | `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again) |
 | `GET /videos/{id}/rallies` | `{data: [{id, start, end, duration}], count}`, seconds |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
@@ -243,8 +243,22 @@ Settings come from `.env` (see `.env.example` for all of them). The main ones:
 
 - The OpenAPI schema is at `http://localhost:8000/api/v1/openapi.json`. Generate the
   TypeScript client from it in the frontend repo rather than writing types by hand.
-- All times are seconds (float). Court coordinates are fractions 0-1 of the video's
-  displayed `width`/`height`.
+- All times are seconds (float). Court coordinates are fractions of the video's
+  displayed `width`/`height`: 0-1 is inside the frame.
+- **Off-screen court corners.** A phone on a tripod often cuts off a near corner, so
+  the court-tapping screen should show a gray margin around the frame (like the
+  research tool `pick_court.py`) where those corners can be tapped. A tap in the margin
+  is just a fraction below 0 or above 1. The backend decides what that means; the app
+  only shows the result:
+
+  | Furthest corner outside the frame | API |
+  |---|---|
+  | up to 10% (-0.1 to 1.1) | accepted, `court_out_of_frame: false` |
+  | up to 30% (-0.3 to 1.3) | accepted, `court_out_of_frame: true`: tell the user "part of your court is out of frame, results may be less accurate" and let them continue or re-mark |
+  | further | 422: a mis-tap, not a court |
+
+  `court_out_of_frame` is on every video response, so any screen can show it. The
+  limits are `COURT_MARGIN_OK` / `COURT_MARGIN_MAX` in `backend/app/models.py`.
 - Play a video with `<video src={API_HOST + fileUrl.url}>` from `GET /videos/{id}/file-url`.
   Fetch the court frame with the login header (e.g. into a blob URL).
 
