@@ -1,6 +1,10 @@
 # Secrets: commit .env.example, never .env
 .env
 
+# Local notes for Claude Code (not part of the repo)
+CLAUDE.md
+.claude/
+
 # Large / private data — never commit
 storage/
 *.mp4

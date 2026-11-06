@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.api.deps import get_db
@@ -33,6 +34,13 @@ def db() -> Generator[Session]:
         init_db(session)
         yield session
     app.dependency_overrides.clear()
+
+
+@pytest.fixture(scope="session")
+def engine() -> Engine:
+    """The test database engine, for tests that need several independent sessions
+    (e.g. two workers)."""
+    return test_engine
 
 
 @pytest.fixture(scope="session", autouse=True)

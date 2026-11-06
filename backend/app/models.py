@@ -130,11 +130,18 @@ class Video(SQLModel, table=True):
     court_corners: list[list[float]] | None = Field(
         default=None, sa_column=Column(JSONB(none_as_null=True))
     )
+    # Worker bookkeeping (not in the API). claim_id is new on every claim; a worker
+    # only writes to the video while claim_id is still its own, so a worker that was
+    # wrongly declared dead can't overwrite the results of the one that took over.
+    claim_id: uuid.UUID | None = None
+    claimed_by: str | None = Field(default=None, max_length=255)  # "hostname:pid"
+    attempts: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
     created_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),
     )
-    # The worker also refreshes this while processing, as a heartbeat
+    # While processing, the worker refreshes this every few seconds as a heartbeat,
+    # using the database's clock (see crud.claim_next_video)
     updated_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),

@@ -13,8 +13,9 @@ The API is built on the
 [Full Stack FastAPI Template](https://github.com/fastapi/full-stack-fastapi-template):
 FastAPI, SQLModel, PostgreSQL, Alembic migrations, JWT login, pytest.
 
-> **Status: beta prototype.** Working: the API (with accounts) and the processing
-> pipeline (CLI). Not yet: the background worker loop, so uploaded videos stay `queued`.
+> **Status: beta prototype.** Working end to end: upload → mark court → queue → the
+> worker finds the rallies → `GET /videos/{id}/rallies`. Not yet: rally corrections,
+> deployment.
 
 ## Repo layout
 
@@ -27,9 +28,11 @@ backend/             FastAPI API (the template's "app" package)
     media.py           ffprobe/ffmpeg helpers (video info, frames)
     core/              settings, database engine, password + token security
     alembic/versions/  database migrations
-  tests/             pytest
+  tests/             pytest (incl. the worker loop, with a fake pipeline)
   scripts/           prestart (migrate + create admin), test, lint, format
 worker/              processing: downscale → TrackNet shuttle tracking → rally detection
+  run_worker.py        the job loop: claims queued videos, runs the pipeline
+  pipeline.py          one video in, rallies out (also a CLI)
   tracknet/            TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/               model weights (not in git, see below)
 compose.yml          local Postgres, Adminer (DB browser), Mailpit (test emails)
@@ -72,6 +75,9 @@ uv run bash scripts/prestart.sh
 
 # 3. API with auto-reload
 uv run fastapi dev
+
+# 4. In a second terminal, from the repo root: the worker that processes videos
+uv run --package worker python worker/run_worker.py
 ```
 
 - **API docs:** http://localhost:8000/docs. Click **Authorize** and log in with
@@ -155,6 +161,38 @@ uv run alembic revision --autogenerate -m "Add xyz to video"
 uv run alembic upgrade head
 ```
 
+## The worker
+
+```bash
+uv run --package worker python worker/run_worker.py                  # until Ctrl+C
+uv run --package worker python worker/run_worker.py --once           # wait for one job, then exit
+uv run --package worker python worker/run_worker.py --batch-size 16  # on an NVIDIA GPU
+```
+
+It checks the queue every 5 s (`--poll`), takes the oldest queued video, and sets it to
+`processing` → `done` (rallies saved) or `failed` (with the error in `error`).
+Reprocessing a video replaces its old rallies, in the same transaction that marks it
+done, so the app never sees half-saved results. A failed reprocess keeps the old ones.
+
+You can run several workers at once, on one machine or on several machines using the
+same database:
+
+- **Each job goes to exactly one worker.** Claiming uses `SELECT ... FOR UPDATE SKIP
+  LOCKED`: the row is locked while one worker claims it, and the others skip it and take
+  the next video instead of waiting.
+- **Heartbeat.** While a job runs, a background thread updates the video's `progress`
+  and `updated_at` every 5 s, using the database's clock (not each machine's, which may
+  differ).
+- **Crashed workers.** Before claiming, every worker re-queues videos whose heartbeat is
+  older than 2 minutes (`--stale-after`). After 3 attempts the video is marked `failed`
+  instead, so a video that crashes the worker every time doesn't loop forever.
+- **Claim token.** Each claim gets a new `claim_id`, and a worker only writes while the
+  video's `claim_id` is still its own. A worker that was wrongly declared dead (laptop
+  asleep) stops when it wakes up instead of overwriting the other worker's results.
+- **Ctrl+C** puts the current video straight back in the queue.
+
+Intermediate files go to `storage/<video id>/work/`.
+
 ## Run the pipeline directly (no API)
 
 Useful for testing detection on one video. Takes about 0.5–1× the video's length on an
@@ -205,7 +243,11 @@ is outside the frame.
 - **`ffprobe not found` / `ffmpeg not found`**: `brew install ffmpeg`.
 - **`Cannot connect to the Docker daemon`**: start Docker Desktop.
 - **`connection refused` on port 5433**: `docker compose up -d`.
-- **`relation "video" does not exist`**: run `uv run bash scripts/prestart.sh` in `backend/`.
+- **`relation "video" does not exist`** or **`column video.claim_id does not exist`**:
+  run `uv run bash scripts/prestart.sh` in `backend/` (applies new migrations).
+- **Videos stay `queued`**: the worker isn't running (`worker/run_worker.py`).
+- **A video failed with `FileNotFoundError ... TrackNet_best.pt`**: copy the model weights
+  into `worker/ckpts/` (see Setup), then queue the video again.
 - **A different Python environment is active** (uv warns that `VIRTUAL_ENV` doesn't
   match): harmless, uv uses the project's `.venv`. Run `deactivate` to silence it.
 - **VS Code shows "Unable to import ..."**: *Python: Select Interpreter* →
