@@ -10,44 +10,78 @@ permissions:
 
 jobs:
   test-backend:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Pinned instead of ubuntu-latest, which is moving to a new Ubuntu release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Every `uv run` uses the environment installed by "Install Python
+      # dependencies" below and never installs anything extra on its own
+      UV_NO_SYNC: "1"
     steps:
       - name: Checkout
+        timeout-minutes: 2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Set up Python
+        timeout-minutes: 3
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: .python-version
       - name: Install uv
+        timeout-minutes: 3
         uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
         with:
           version: "latest-known"
-      # The video endpoints use ffprobe/ffmpeg, and the tests make sample videos with it
+          # Reuse downloaded packages between runs; a new cache when uv.lock changes
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      # Only the API package ("app") and its dev tools. The tests don't need the
+      # worker's torch/opencv: the worker loop is tested with a fake pipeline.
+      # --locked fails if uv.lock is out of date with pyproject.toml.
+      - name: Install Python dependencies (API only, no torch)
+        timeout-minutes: 5
+        run: uv sync --locked --package app
+      # The video endpoints use ffprobe/ffmpeg, and the tests make sample videos
+      # with it. A stalled package mirror once hung this step for 10 minutes:
+      # apt now gives up on a stuck download after 30 s and retries.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        timeout-minutes: 5
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y --no-install-recommends ffmpeg
+          ffprobe -version | head -n 1
       # .env is gitignored; the example's development defaults are fine for CI
-      - run: cp .env.example .env
-      - run: docker compose down -v --remove-orphans
-      - run: docker compose up -d --wait db mailpit
+      - timeout-minutes: 1
+        run: cp .env.example .env
+      - timeout-minutes: 2
+        run: docker compose down -v --remove-orphans
+      - name: Start Postgres and Mailpit
+        timeout-minutes: 5
+        run: docker compose up -d --wait db mailpit
       - name: Lint (mypy, ty, ruff)
+        timeout-minutes: 5
         run: uv run bash scripts/lint.sh
         working-directory: backend
       - name: Migrate DB
+        timeout-minutes: 3
         run: uv run bash scripts/prestart.sh
         working-directory: backend
       - name: Run tests
+        timeout-minutes: 10
         run: uv run bash scripts/tests-start.sh "Coverage for ${{ github.sha }}"
         working-directory: backend
-      - run: docker compose down -v --remove-orphans
+      - timeout-minutes: 2
+        run: docker compose down -v --remove-orphans
       - name: Store coverage files
+        timeout-minutes: 3
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-html
           path: backend/htmlcov
           include-hidden-files: true
       - name: Coverage report
+        timeout-minutes: 2
         run: uv run coverage report --fail-under=90
         working-directory: backend
