@@ -104,9 +104,9 @@ own videos; the superuser sees all.
 |---|---|
 | `POST /videos/` | Upload a video (multipart, field `file`) |
 | `GET /videos/` | Your videos, newest first: `{data, count}` |
-| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court |
+| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning |
 | `GET /videos/{id}/frame?t=1` | JPEG frame for marking the court |
-| `PUT /videos/{id}/court` | 4 court corners as fractions 0-1, order far-left, far-right, near-right, near-left. Not allowed while queued/processing. |
+| `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
 | `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again) |
 | `GET /videos/{id}/rallies` | `{data: [{id, start, end, duration}], count}`, seconds |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
@@ -195,8 +195,8 @@ Intermediate files go to `storage/<video id>/work/`.
 
 ## Run the pipeline directly (no API)
 
-Useful for testing detection on one video. Takes about 0.5–1× the video's length on an
-Apple Silicon Mac.
+Useful for testing detection on one video. Takes about half the video's length on an
+Apple Silicon Mac (7-min match: 3.7 min; 21-min match: 10.6 min).
 
 ```bash
 uv run --package worker python worker/pipeline.py ../badminton-test/match4_720.mp4 \
@@ -205,6 +205,22 @@ uv run --package worker python worker/pipeline.py ../badminton-test/match4_720.m
 
 It prints the rallies and writes intermediate files (720p video, shuttle CSV, court.json,
 rallies.json) to `worker/output/<video name>/`. Use `--batch-size 16` on an NVIDIA GPU.
+
+**Where the time goes** (match 4, 7.1 min of 720p video, M-series Mac):
+
+| Phase | Time |
+|---|---|
+| Count frames | 3 s |
+| Background (median) image | 10 s |
+| Model load | < 1 s |
+| Shuttle tracking | ~210 s |
+| Rally detection | < 0.1 s |
+
+The background image is the median of 300 frames, read front to back
+(`MEDIAN_SAMPLES` in `worker/tracknet/infer.py`). TrackNet's own version seeks to
+~1800 frames and took 124 s and 15 GB of memory for the same video, with no
+accuracy benefit: same score on match 4, and 72 of 73 rallies unchanged on match 5.
+Below ~150 frames, accuracy started to drop.
 
 ## Configuration
 
@@ -227,8 +243,22 @@ Settings come from `.env` (see `.env.example` for all of them). The main ones:
 
 - The OpenAPI schema is at `http://localhost:8000/api/v1/openapi.json`. Generate the
   TypeScript client from it in the frontend repo rather than writing types by hand.
-- All times are seconds (float). Court coordinates are fractions 0-1 of the video's
-  displayed `width`/`height`.
+- All times are seconds (float). Court coordinates are fractions of the video's
+  displayed `width`/`height`: 0-1 is inside the frame.
+- **Off-screen court corners.** A phone on a tripod often cuts off a near corner, so
+  the court-tapping screen should show a gray margin around the frame (like the
+  research tool `pick_court.py`) where those corners can be tapped. A tap in the margin
+  is just a fraction below 0 or above 1. The backend decides what that means; the app
+  only shows the result:
+
+  | Furthest corner outside the frame | API |
+  |---|---|
+  | up to 10% (-0.1 to 1.1) | accepted, `court_out_of_frame: false` |
+  | up to 30% (-0.3 to 1.3) | accepted, `court_out_of_frame: true`: tell the user "part of your court is out of frame, results may be less accurate" and let them continue or re-mark |
+  | further | 422: a mis-tap, not a court |
+
+  `court_out_of_frame` is on every video response, so any screen can show it. The
+  limits are `COURT_MARGIN_OK` / `COURT_MARGIN_MAX` in `backend/app/models.py`.
 - Play a video with `<video src={API_HOST + fileUrl.url}>` from `GET /videos/{id}/file-url`.
   Fetch the court frame with the login header (e.g. into a blob URL).
 

@@ -1,4 +1,5 @@
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Annotated, Literal, Self
 
@@ -77,17 +78,39 @@ class UsersPublic(SQLModel):
 # uploaded -> queued -> processing -> done | failed  (done/failed can be queued again)
 VideoStatus = Literal["uploaded", "queued", "processing", "done", "failed"]
 
-# Court corners are fractions 0-1 of the displayed width/height (resolution
-# independent); pixels only exist inside the worker.
-Fraction01 = Annotated[float, PydanticField(ge=0, le=1)]
-Point = tuple[Fraction01, Fraction01]
+# Court corners are fractions of the displayed width/height (resolution independent);
+# pixels only exist inside the worker. 0-1 is inside the frame, but a corner may be
+# a little outside it (phone on a tripod; the court-tapping screen shows a gray margin
+# around the frame so it can be tapped there):
+COURT_MARGIN_OK = 0.1  # up to 10% outside the frame: fine, no warning (e.g. match 5)
+COURT_MARGIN_MAX = (
+    0.3  # up to 30% outside: accepted, with the court_out_of_frame warning
+)
+# Further out is rejected: that's a mis-tap, not a real court.
+CourtCoord = Annotated[
+    float, PydanticField(ge=-COURT_MARGIN_MAX, le=1 + COURT_MARGIN_MAX)
+]
+Point = tuple[CourtCoord, CourtCoord]
+
+
+def is_court_out_of_frame(corners: Sequence[Sequence[float]]) -> bool:
+    """True if any corner is more than COURT_MARGIN_OK outside the video frame."""
+    return any(
+        v < -COURT_MARGIN_OK or v > 1 + COURT_MARGIN_OK
+        for point in corners
+        for v in point
+    )
 
 
 class CourtUpdate(SQLModel):
     corners: list[Point] = Field(
         min_length=4,
         max_length=4,
-        description="Fractions 0-1 of width/height, order: far-left, far-right, near-right, near-left",
+        description=(
+            "Fractions of width/height, order: far-left, far-right, near-right, "
+            "near-left. 0-1 is inside the frame; -0.3 to 1.3 is accepted (see "
+            "court_out_of_frame on the video)."
+        ),
         schema_extra={
             "examples": [
                 [[0.478, 0.347], [0.777, 0.369], [0.930, 0.943], [0.054, 0.781]]
@@ -169,6 +192,16 @@ class VideoPublic(SQLModel):
     court_corners: list[Point] | None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def court_out_of_frame(self) -> bool:
+        """Warning, not an error: part of the court is well outside the video, so
+        results may be less accurate. The app should tell the user and let them
+        decide. Computed here so the web and mobile apps can't disagree."""
+        return self.court_corners is not None and is_court_out_of_frame(
+            self.court_corners
+        )
 
 
 class VideosPublic(SQLModel):

@@ -21,10 +21,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 
 from dataset import Video_IterableDataset
 from utils.general import HEIGHT, WIDTH, get_model, to_img, to_img_format, write_pred_csv
+
+# How many frames the background (median) image is built from. TrackNet's own
+# version seeks to ~1800 frames and takes the median of the full-size stack: on
+# match 4 (7 min, 720p) that took 124 s and 15 GB of memory, more than half as long
+# as tracking itself. 300 frames read front to back: 10 s, 2.5 GB, and the same
+# rallies and score on match 4. Fewer frames started to cost accuracy.
+MEDIAN_SAMPLES = 300
 
 
 def pick_device():
@@ -67,6 +75,38 @@ def heatmaps_to_coords(indices, y_pred, img_scaler):
     return out
 
 
+def background_median(video_path, video_len, bg_mode, samples=MEDIAN_SAMPLES):
+    """Median of ~`samples` evenly spaced frames: the empty-court background the model
+    compares each frame against.
+
+    Reads the video once, front to back, keeping every k-th frame. Seeking to each
+    frame instead (as TrackNet does) makes H.264 decode from the previous keyframe
+    every time. Post-processing is the same as dataset.Video_IterableDataset.__gen_median__.
+    """
+    step = max(1, video_len // samples)
+    cap = cv2.VideoCapture(video_path)
+    frames = []
+    try:
+        for i in range(video_len):
+            if i % step == 0:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                frames.append(frame)
+            elif not cap.grab():  # decode, but skip converting the frame
+                break
+    finally:
+        cap.release()
+    if not frames:
+        raise ValueError(f"Couldn't read any frames from {video_path}")
+    median = np.median(frames, 0)[..., ::-1]  # BGR to RGB
+    if bg_mode == "concat":
+        median = Image.fromarray(median.astype("uint8"))
+        median = np.array(median.resize(size=(WIDTH, HEIGHT)))
+        median = np.moveaxis(median, -1, 0)
+    return median
+
+
 def track_shuttle(video_path, ckpt_path, out_csv, batch_size=4, device=None, on_progress=None):
     """Run TrackNet on every frame of video_path and write a Frame,Visibility,X,Y CSV
     (pixel coords of that video). on_progress(done_frames, total_frames) is called per batch."""
@@ -78,7 +118,13 @@ def track_shuttle(video_path, ckpt_path, out_csv, batch_size=4, device=None, on_
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    dataset = Video_IterableDataset(video_path, seq_len=seq_len, sliding_step=seq_len, bg_mode=bg_mode)
+    # Passing a median skips the dataset's own slow one; the real one is set right
+    # after, once the dataset has counted the frames.
+    dataset = Video_IterableDataset(
+        video_path, seq_len=seq_len, sliding_step=seq_len, bg_mode=bg_mode, median=np.zeros(1)
+    )
+    if bg_mode:
+        dataset.median = background_median(video_path, dataset.video_len, bg_mode)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=False)
     img_scaler = (dataset.w / WIDTH, dataset.h / HEIGHT)
 
