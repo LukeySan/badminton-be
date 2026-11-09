@@ -7,7 +7,8 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session
+from sqlalchemy import Engine, event
+from sqlmodel import Session, col, select, update
 
 from app import crud, media
 from app.core.config import settings
@@ -135,21 +136,32 @@ def test_list_shows_only_own_videos(
     other_user_headers: dict[str, str],
     superuser_token_headers: dict[str, str],
 ) -> None:
-    def ids(headers: dict[str, str]) -> set[str]:
-        r = client.get(f"{API}/", headers=headers)
+    def ids(headers: dict[str, str], **params: Any) -> set[str]:
+        r = client.get(f"{API}/", headers=headers, params=params)
         assert r.status_code == 200
         assert r.json()["count"] >= len(r.json()["data"])
         return {v["id"] for v in r.json()["data"]}
 
     assert video["id"] in ids(normal_user_token_headers)
     assert video["id"] not in ids(other_user_headers)
-    assert video["id"] in ids(superuser_token_headers)
+    # superusers also see only their own by default...
+    assert video["id"] not in ids(superuser_token_headers)
+    # ...and everyone's with all=true
+    assert video["id"] in ids(superuser_token_headers, all=True)
+
+
+def test_list_all_requires_superuser(
+    client: TestClient, normal_user_token_headers: dict[str, str]
+) -> None:
+    r = client.get(f"{API}/", headers=normal_user_token_headers, params={"all": True})
+    assert r.status_code == 403
 
 
 @pytest.mark.parametrize(
     ("method", "path"),
     [
         ("get", ""),
+        ("delete", ""),
         ("get", "/frame"),
         ("put", "/court"),
         ("post", "/process"),
@@ -436,3 +448,212 @@ def test_deleting_account_removes_video_files(
     assert not (settings.STORAGE_DIR / video_id).exists()
     db.expire_all()
     assert db.get(Video, uuid.UUID(video_id)) is None  # row removed by cascade
+
+
+# --- list: paging, rally stats, query count -----------------------------------
+
+
+@pytest.fixture
+def fresh_user_headers(client: TestClient, db: Session) -> dict[str, str]:
+    """A new user with no videos, so counts and order are exact."""
+    email, password = random_email(), random_lower_string()
+    crud.create_user(session=db, user_create=UserCreate(email=email, password=password))
+    return user_authentication_headers(client=client, email=email, password=password)
+
+
+def add_rallies(db: Session, video_id: str, spans: list[tuple[float, float]]) -> None:
+    db.add_all(
+        Rally(video_id=uuid.UUID(video_id), start=start, end=end)
+        for start, end in spans
+    )
+    db.commit()
+
+
+def test_list_is_newest_first_and_count_is_the_total(
+    client: TestClient, fresh_user_headers: dict[str, str], sample_video: Path
+) -> None:
+    uploaded = [
+        upload(client, fresh_user_headers, sample_video).json()["id"] for _ in range(3)
+    ]
+    r = client.get(f"{API}/", headers=fresh_user_headers, params={"limit": 2})
+    assert r.json()["count"] == 3  # all of the user's videos, not just this page
+    assert [v["id"] for v in r.json()["data"]] == uploaded[::-1][:2]
+    r = client.get(f"{API}/", headers=fresh_user_headers, params={"skip": 2})
+    assert [v["id"] for v in r.json()["data"]] == [uploaded[0]]
+
+
+def test_rally_stats_on_every_video_response(
+    client: TestClient,
+    db: Session,
+    fresh_user_headers: dict[str, str],
+    sample_video: Path,
+) -> None:
+    h = fresh_user_headers
+    with_rallies = upload(client, h, sample_video).json()
+    without = upload(client, h, sample_video).json()
+    assert (without["rally_count"], without["play_seconds"]) == (0, 0.0)
+    add_rallies(db, with_rallies["id"], [(3.0, 9.25), (20.5, 31.0), (40.1, 40.2)])
+    expected = (3, 16.85)  # 6.25 + 10.5 + 0.1
+
+    listed = {v["id"]: v for v in client.get(f"{API}/", headers=h).json()["data"]}
+    assert (
+        listed[with_rallies["id"]]["rally_count"],
+        listed[with_rallies["id"]]["play_seconds"],
+    ) == expected
+    assert (
+        listed[without["id"]]["rally_count"],
+        listed[without["id"]]["play_seconds"],
+    ) == (0, 0.0)
+
+    url = f"{API}/{with_rallies['id']}"
+    responses = [
+        client.get(url, headers=h),
+        client.put(f"{url}/court", headers=h, json=COURT),
+        client.post(f"{url}/process", headers=h),
+    ]
+    for r in responses:
+        assert r.status_code == 200, r.text
+        assert (r.json()["rally_count"], r.json()["play_seconds"]) == expected
+
+
+def test_list_takes_the_same_number_of_queries_for_any_number_of_videos(
+    client: TestClient,
+    db: Session,
+    engine: Engine,
+    fresh_user_headers: dict[str, str],
+    sample_video: Path,
+) -> None:
+    """No query per video: the app can show rally counts for a whole list at once."""
+    statements: list[str] = []
+
+    def count_queries() -> int:
+        statements.clear()
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            r = client.get(f"{API}/", headers=fresh_user_headers)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+        assert r.status_code == 200
+        return len(statements)
+
+    def record(_conn: Any, _cursor: Any, statement: str, *_: Any) -> None:
+        statements.append(statement)
+
+    first = upload(client, fresh_user_headers, sample_video).json()["id"]
+    add_rallies(db, first, [(1.0, 2.0)])
+    with_one = count_queries()
+    for _ in range(4):
+        vid = upload(client, fresh_user_headers, sample_video).json()["id"]
+        add_rallies(db, vid, [(1.0, 2.0), (5.0, 9.0)])
+    assert count_queries() == with_one
+
+
+# --- delete -------------------------------------------------------------------
+
+
+def set_status(db: Session, video_id: str, status: str) -> None:
+    db.exec(
+        update(Video).where(col(Video.id) == uuid.UUID(video_id)).values(status=status)
+    )
+    db.commit()
+
+
+def rally_count_in_db(db: Session, video_id: str) -> int:
+    return len(
+        db.exec(select(Rally).where(Rally.video_id == uuid.UUID(video_id))).all()
+    )
+
+
+def test_delete_video(
+    client: TestClient,
+    db: Session,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    add_rallies(db, video["id"], [(1.0, 5.0)])
+    url = f"{API}/{video['id']}"
+
+    r = client.delete(url, headers=normal_user_token_headers)
+    assert r.status_code == 200
+    assert r.json()["message"] == "Video deleted successfully"
+    assert client.get(url, headers=normal_user_token_headers).status_code == 404
+    assert not (settings.STORAGE_DIR / video["id"]).exists()
+    assert rally_count_in_db(db, video["id"]) == 0
+    # deleting again: gone
+    assert client.delete(url, headers=normal_user_token_headers).status_code == 404
+
+
+def test_other_user_cannot_delete(
+    client: TestClient,
+    video: dict[str, Any],
+    other_user_headers: dict[str, str],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    r = client.delete(f"{API}/{video['id']}", headers=other_user_headers)
+    assert r.status_code == 404
+    assert (settings.STORAGE_DIR / video["id"]).exists()
+    r = client.get(f"{API}/{video['id']}", headers=normal_user_token_headers)
+    assert r.status_code == 200
+
+
+def test_superuser_can_delete_any_video(
+    client: TestClient, video: dict[str, Any], superuser_token_headers: dict[str, str]
+) -> None:
+    r = client.delete(f"{API}/{video['id']}", headers=superuser_token_headers)
+    assert r.status_code == 200
+    assert not (settings.STORAGE_DIR / video["id"]).exists()
+
+
+def test_cannot_delete_while_processing(
+    client: TestClient,
+    db: Session,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    add_rallies(db, video["id"], [(1.0, 5.0)])
+    set_status(db, video["id"], "processing")
+    url = f"{API}/{video['id']}"
+
+    r = client.delete(url, headers=normal_user_token_headers)
+    assert r.status_code == 409
+    assert "being processed" in r.json()["detail"]
+    # nothing removed
+    assert (settings.STORAGE_DIR / video["id"]).exists()
+    assert client.get(url, headers=normal_user_token_headers).status_code == 200
+    assert rally_count_in_db(db, video["id"]) == 1
+
+    set_status(db, video["id"], "done")
+    assert client.delete(url, headers=normal_user_token_headers).status_code == 200
+
+
+@pytest.mark.parametrize("status", ["uploaded", "queued", "done", "failed"])
+def test_can_delete_in_any_other_status(
+    client: TestClient,
+    db: Session,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+    status: str,
+) -> None:
+    set_status(db, video["id"], status)
+    r = client.delete(f"{API}/{video['id']}", headers=normal_user_token_headers)
+    assert r.status_code == 200
+
+
+def test_delete_race_with_another_delete(
+    client: TestClient,
+    db: Session,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two deletes at once (double click): the one that loses gets 404, not 409."""
+    real_delete = crud.delete_video
+
+    def deleted_first_by_someone_else(*, session: Session, video_id: uuid.UUID) -> bool:
+        with Session(db.get_bind()) as other:
+            real_delete(session=other, video_id=video_id)
+        return False
+
+    monkeypatch.setattr(crud, "delete_video", deleted_first_by_someone_else)
+    r = client.delete(f"{API}/{video['id']}", headers=normal_user_token_headers)
+    assert r.status_code == 404

@@ -192,6 +192,12 @@ class VideoPublic(SQLModel):
     court_corners: list[Point] | None
     created_at: datetime
     updated_at: datetime
+    # Filled in by crud (one aggregate query, also for whole lists)
+    rally_count: int = Field(description="Number of detected rallies")
+    play_seconds: float = Field(
+        description="Total rally time in seconds (sum of rally durations): "
+        "the match without the breaks"
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property

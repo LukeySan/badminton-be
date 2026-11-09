@@ -7,7 +7,15 @@ from sqlalchemy import update
 from sqlmodel import Session, col, delete, func, select
 
 from app.core.security import get_password_hash, verify_password
-from app.models import Rally, User, UserCreate, UserUpdate, Video, get_datetime_utc
+from app.models import (
+    Rally,
+    User,
+    UserCreate,
+    UserUpdate,
+    Video,
+    VideoPublic,
+    get_datetime_utc,
+)
 
 
 def create_user(*, session: Session, user_create: UserCreate) -> User:
@@ -108,6 +116,84 @@ def queue_video(*, session: Session, video_id: uuid.UUID) -> bool:
     )
     session.commit()
     return result.rowcount == 1
+
+
+def delete_video(*, session: Session, video_id: uuid.UUID) -> bool:
+    """Delete the video unless a worker is processing it. Its rallies and corrections
+    go with it (database cascade); the caller removes the files.
+
+    One conditional DELETE: if a worker claims the video at the same moment, the row
+    lock decides who goes first, so a video is never deleted mid-processing.
+    Returns False if nothing was deleted (processing, or already gone)."""
+    result = session.exec(
+        delete(Video).where(
+            col(Video.id) == video_id, col(Video.status) != "processing"
+        )
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+# --- Video lists with rally stats ---------------------------------------------
+# rally_count / play_seconds come from one GROUP BY over the rallies, joined onto
+# the video query, so a list of N videos is still one query, not N + 1.
+
+
+def _rally_stats() -> Any:
+    return (
+        select(
+            col(Rally.video_id).label("video_id"),
+            func.count().label("rally_count"),
+            func.sum(col(Rally.end) - col(Rally.start)).label("play_seconds"),
+        )
+        .group_by(col(Rally.video_id))
+        .subquery()
+    )
+
+
+def _to_public(
+    video: Video, rally_count: int | None, play_seconds: float | None
+) -> VideoPublic:
+    return VideoPublic.model_validate(
+        video,
+        update={
+            "rally_count": rally_count or 0,
+            "play_seconds": round(play_seconds or 0.0, 2),
+        },
+    )
+
+
+def list_videos(
+    *, session: Session, owner_id: uuid.UUID | None, skip: int = 0, limit: int = 100
+) -> tuple[list[VideoPublic], int]:
+    """Videos newest first, with rally stats, and the total count.
+    owner_id=None means everyone's videos."""
+    stats = _rally_stats()
+    statement = select(Video, stats.c.rally_count, stats.c.play_seconds).outerjoin(
+        stats, col(Video.id) == stats.c.video_id
+    )
+    count_statement = select(func.count()).select_from(Video)
+    if owner_id is not None:
+        statement = statement.where(col(Video.owner_id) == owner_id)
+        count_statement = count_statement.where(col(Video.owner_id) == owner_id)
+    rows = session.exec(
+        statement.order_by(col(Video.created_at).desc(), col(Video.id))
+        .offset(skip)
+        .limit(limit)
+    ).all()
+    count = session.exec(count_statement).one()
+    return [_to_public(video, n, s) for video, n, s in rows], count
+
+
+def get_video_public(*, session: Session, video: Video) -> VideoPublic:
+    """One video as the API returns it, with its rally stats."""
+    rally_count, play_seconds = session.exec(
+        select(
+            func.count(col(Rally.id)),
+            func.sum(col(Rally.end) - col(Rally.start)),
+        ).where(col(Rally.video_id) == video.id)
+    ).one()
+    return _to_public(video, rally_count, play_seconds)
 
 
 # --- Worker jobs ------------------------------------------------------------
