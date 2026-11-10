@@ -103,8 +103,9 @@ own videos; the superuser sees all.
 | Endpoint | What it does |
 |---|---|
 | `POST /videos/` | Upload a video (multipart, field `file`) |
-| `GET /videos/` | Your videos, newest first: `{data, count}` |
-| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning |
+| `GET /videos/` | Your videos, newest first: `{data, count}` (`count` = all of them, for paging with `skip`/`limit`). Superusers: `?all=true` for everyone's (403 for others) |
+| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning, `rally_count`, `play_seconds` (total rally time) |
+| `DELETE /videos/{id}` | Delete a video with its rallies and files (yours, or any as a superuser). 409 while it's being processed |
 | `GET /videos/{id}/frame?t=1` | JPEG frame for marking the court |
 | `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
 | `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again) |

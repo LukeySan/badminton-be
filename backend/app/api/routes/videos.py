@@ -6,7 +6,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
-from sqlmodel import Session, col, func, select
+from sqlmodel import Session
 
 from app import crud, media
 from app.api.deps import CurrentUser, SessionDep
@@ -15,6 +15,7 @@ from app.core.security import create_file_token, verify_file_token
 from app.models import (
     CourtUpdate,
     FileUrl,
+    Message,
     RalliesPublic,
     User,
     Video,
@@ -43,23 +44,36 @@ def get_video_for_user(
     return video
 
 
-@router.get("/", response_model=VideosPublic)
+@router.get(
+    "/",
+    response_model=VideosPublic,
+    responses={403: {"description": "all=true without superuser rights"}},
+)
 def read_videos(
-    session: SessionDep, current_user: CurrentUser, skip: int = 0, limit: int = 100
+    session: SessionDep,
+    current_user: CurrentUser,
+    skip: int = 0,
+    limit: int = 100,
+    show_all: Annotated[
+        bool,
+        Query(alias="all", description="Superusers only: everyone's videos"),
+    ] = False,
 ) -> Any:
     """
-    Retrieve videos, newest first (all videos for superusers, otherwise your own).
+    Your videos, newest first, each with its rally count and total rally time.
     """
-    count_statement = select(func.count()).select_from(Video)
-    statement = select(Video)
-    if not current_user.is_superuser:
-        count_statement = count_statement.where(Video.owner_id == current_user.id)
-        statement = statement.where(Video.owner_id == current_user.id)
-    count = session.exec(count_statement).one()
-    videos = session.exec(
-        statement.order_by(col(Video.created_at).desc()).offset(skip).limit(limit)
-    ).all()
-    return VideosPublic(data=videos, count=count)  # type: ignore[arg-type]
+    if show_all and not current_user.is_superuser:
+        # An error rather than silently showing your own: a frontend bug shows up
+        raise HTTPException(
+            status_code=403, detail="The user doesn't have enough privileges"
+        )
+    videos, count = crud.list_videos(
+        session=session,
+        owner_id=None if show_all else current_user.id,
+        skip=skip,
+        limit=limit,
+    )
+    return VideosPublic(data=videos, count=count)
 
 
 @router.post("/", response_model=VideoPublic, status_code=201)
@@ -105,16 +119,43 @@ def upload_video(
     session.add(video)
     session.commit()
     session.refresh(video)
-    return video
+    return crud.get_video_public(session=session, video=video)
 
 
 @router.get("/{id}", response_model=VideoPublic)
 def read_video(session: SessionDep, current_user: CurrentUser, id: uuid.UUID) -> Any:
     """
     Get a video: status (uploaded → queued → processing → done | failed), progress,
-    size, court.
+    size, court, rally count and total rally time.
     """
-    return get_video_for_user(session, current_user, id)
+    video = get_video_for_user(session, current_user, id)
+    return crud.get_video_public(session=session, video=video)
+
+
+@router.delete(
+    "/{id}",
+    response_model=Message,
+    responses={409: {"description": "The video is being processed"}},
+)
+def delete_video(session: SessionDep, current_user: CurrentUser, id: uuid.UUID) -> Any:
+    """
+    Delete a video with its rallies and files (yours, or any as a superuser).
+    Not allowed while it's being processed.
+    """
+    video = get_video_for_user(session, current_user, id)
+    video_dir = settings.STORAGE_DIR / str(video.id)
+    if not crud.delete_video(session=session, video_id=id):
+        session.expire_all()
+        if session.get(Video, id) is None:  # deleted by another request meanwhile
+            raise HTTPException(status_code=404, detail="Video not found")
+        raise HTTPException(
+            status_code=409,
+            detail="The video is being processed; delete it once processing has finished",
+        )
+    # Files after the database: if this fails, only orphan files are left, never a
+    # video whose files are gone
+    shutil.rmtree(video_dir, ignore_errors=True)
+    return Message(message="Video deleted successfully")
 
 
 @router.get(
@@ -157,7 +198,7 @@ def update_video_court(
             detail=f"Can't change the court while the video is {video.status}",
         )
     session.refresh(video)
-    return video
+    return crud.get_video_public(session=session, video=video)
 
 
 @router.post("/{id}/process", response_model=VideoPublic)
@@ -175,7 +216,7 @@ def process_video(session: SessionDep, current_user: CurrentUser, id: uuid.UUID)
             )
         raise HTTPException(status_code=409, detail=f"Video is already {video.status}")
     session.refresh(video)
-    return video
+    return crud.get_video_public(session=session, video=video)
 
 
 @router.get("/{id}/rallies", response_model=RalliesPublic)

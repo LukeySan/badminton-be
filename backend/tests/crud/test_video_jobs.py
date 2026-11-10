@@ -349,3 +349,59 @@ def test_user_requeue_resets_attempts(db: Session, engine: Engine) -> None:
         assert crud.queue_video(session=session, video_id=video_id)
     queued = fetch(engine, video_id)
     assert (queued.status, queued.attempts) == ("queued", 0)
+
+
+# --- deleting vs. claiming ------------------------------------------------------
+
+
+def test_delete_waits_for_a_claim_in_progress_then_refuses(
+    db: Session, engine: Engine
+) -> None:
+    """A worker is mid-claim (row locked, status set, not committed yet) when the
+    user deletes. The delete waits for the lock, then sees 'processing' and
+    deletes nothing."""
+    video_id = make_video(db)
+    result: list[bool] = []
+
+    def user_deletes() -> None:
+        with Session(engine) as session:
+            result.append(crud.delete_video(session=session, video_id=video_id))
+
+    with Session(engine) as worker:
+        worker.exec(
+            select(Video.id).where(col(Video.id) == video_id).with_for_update()
+        ).one()
+        worker.exec(
+            update(Video).where(col(Video.id) == video_id).values(status="processing")
+        )
+        deleting = threading.Thread(target=user_deletes)
+        deleting.start()
+        time.sleep(0.3)
+        assert deleting.is_alive()  # waiting for the worker's row lock
+        worker.commit()
+    deleting.join(timeout=5)
+
+    assert result == [False]
+    assert fetch(engine, video_id).status == "processing"
+
+
+def test_claim_skips_a_video_being_deleted(db: Session, engine: Engine) -> None:
+    """The user's delete has locked the row (not committed yet): a worker skips it
+    instead of waiting, and the video is gone afterwards."""
+    video_id = make_video(db)
+    with Session(engine) as user:
+        user.exec(delete(Video).where(col(Video.id) == video_id))  # row now locked
+        assert claim(engine) is None
+        user.commit()
+    assert claim(engine) is None
+    with Session(engine) as session:
+        assert session.get(Video, video_id) is None
+
+
+def test_delete_video_crud(db: Session, engine: Engine) -> None:
+    queued = make_video(db)
+    processing = make_video(db, status="processing")
+    with Session(engine) as session:
+        assert crud.delete_video(session=session, video_id=queued)
+        assert not crud.delete_video(session=session, video_id=processing)
+        assert not crud.delete_video(session=session, video_id=uuid.uuid4())
