@@ -2,9 +2,16 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import EmailStr, computed_field, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    computed_field,
+    model_validator,
+)
 from pydantic import Field as PydanticField
 from sqlalchemy import Column, DateTime, Text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -281,6 +288,200 @@ class Correction(SQLModel, table=True):
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),
     )
+
+
+# ---------------------------------------------------------------------------
+# Errors the app handles specially carry a machine-readable code
+# ---------------------------------------------------------------------------
+
+
+class ErrorCode(StrEnum):
+    TRAJECTORY_MISSING = "trajectory_missing"  # analyzed before trails existed
+    REEL_CHANGED = "reel_changed"  # stale save: the reel was saved elsewhere
+
+
+class ErrorWithCode(SQLModel):
+    """{"detail": "...", "code": "..."}: detail is for people, code for the app."""
+
+    detail: str
+    code: ErrorCode
+
+
+# ---------------------------------------------------------------------------
+# Shuttle trajectory (a file per video in storage, see app/trajectory.py)
+# ---------------------------------------------------------------------------
+
+
+class TrajectoryPoint(SQLModel):
+    frame: int = Field(description="Frame index; the frame is at frame / fps seconds")
+    t: float = Field(description="Seconds in the original video (frame / fps)")
+    visible: bool = Field(description="Shuttle seen in this frame")
+    x: float | None = Field(description="Fraction of the frame width; null if not seen")
+    y: float | None = Field(
+        description="Fraction of the frame height; null if not seen"
+    )
+
+
+class TrajectoryPublic(SQLModel):
+    fps: float
+    start: float
+    end: float
+    points: list[TrajectoryPoint] = Field(
+        description="Every frame between start and end, in order"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reels: non-destructive highlight edits. The original video is never changed; a
+# reel is an edit list (JSON) that the app plays back. All times are seconds in the
+# original video.
+# ---------------------------------------------------------------------------
+
+REEL_TITLE_MAX_LENGTH = 100
+CAPTION_MAX_LENGTH = 80
+MAX_REEL_ITEMS = 500  # clips / restored gaps / captions per reel
+# The app's player may report a slightly different duration than ffprobe did
+TRIM_TOLERANCE = 0.1  # seconds
+
+
+class EditModel(BaseModel):
+    # Unknown fields are an error, not silently dropped: a typo in the app would
+    # otherwise lose the user's edit without anyone noticing
+    model_config = ConfigDict(extra="forbid")
+
+
+class TimeRange(EditModel):
+    start: float = PydanticField(ge=0)
+    end: float = PydanticField(ge=0)
+
+    @model_validator(mode="after")
+    def check_order(self) -> Self:
+        if self.end <= self.start:
+            raise ValueError("end must be after start")
+        return self
+
+
+class ReelClip(EditModel):
+    rally_id: int | None = PydanticField(
+        description="The rally this clip came from. null: not tied to a rally (its "
+        "rally disappeared when the video was re-analyzed)"
+    )
+    trim_start: float = PydanticField(ge=0)
+    trim_end: float = PydanticField(ge=0)
+    slow_mo: bool = False
+
+    @model_validator(mode="after")
+    def check_order(self) -> Self:
+        if self.trim_end <= self.trim_start:
+            raise ValueError("trim_end must be after trim_start")
+        return self
+
+
+class Caption(TimeRange):
+    text: str = PydanticField(min_length=1, max_length=CAPTION_MAX_LENGTH)
+
+
+class ReelOverlays(EditModel):
+    trail: bool = False  # draw the shuttle trail (needs GET /videos/{id}/trajectory)
+    captions: list[Caption] = PydanticField(default=[], max_length=MAX_REEL_ITEMS)
+
+
+class ReelEdit(EditModel):
+    """The edit list, stored as JSON. `version` lets the format change later:
+    old versions get upgraded when read, so stored reels never need rewriting."""
+
+    version: Literal[1] = 1
+    view: Literal["cut", "full"] = "cut"
+    format: Literal["16:9", "9:16"] = "16:9"
+    clips: list[ReelClip] = PydanticField(
+        default=[], max_length=MAX_REEL_ITEMS, description="In reel order"
+    )
+    restored_gaps: list[TimeRange] = PydanticField(
+        default=[],
+        max_length=MAX_REEL_ITEMS,
+        description="Breaks between rallies shown again in cut view",
+    )
+    overlays: ReelOverlays = PydanticField(default_factory=ReelOverlays)
+
+    def problems(
+        self, *, duration: float | None, rally_ids: set[int]
+    ) -> list[tuple[tuple[str | int, ...], str]]:
+        """Checks that need the video: (location in the edit, message) for each
+        rally_id that isn't one of the video's rallies and each time past its end."""
+        found: list[tuple[tuple[str | int, ...], str]] = []
+        limit = None if duration is None else duration + TRIM_TOLERANCE
+        past_end = f"must be within the video (0-{duration or 0:.2f} s)"
+        for i, clip in enumerate(self.clips):
+            if clip.rally_id is not None and clip.rally_id not in rally_ids:
+                found.append((("clips", i, "rally_id"), "not a rally of this video"))
+            if limit is not None and clip.trim_end > limit:
+                found.append((("clips", i, "trim_end"), past_end))
+        for i, gap in enumerate(self.restored_gaps):
+            if limit is not None and gap.end > limit:
+                found.append((("restored_gaps", i, "end"), past_end))
+        for i, caption in enumerate(self.overlays.captions):
+            if limit is not None and caption.end > limit:
+                found.append((("overlays", "captions", i, "end"), past_end))
+        return found
+
+
+ReelTitle = Annotated[
+    str, PydanticField(min_length=1, max_length=REEL_TITLE_MAX_LENGTH)
+]
+
+
+class Reel(SQLModel, table=True):
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    video_id: uuid.UUID = Field(
+        foreign_key="video.id", nullable=False, ondelete="CASCADE", index=True
+    )
+    # The video's owner (also when a superuser made the reel): a reel belongs to
+    # whoever owns the footage. Stored, not joined, so "my reels" is one query.
+    owner_id: uuid.UUID = Field(
+        foreign_key="user.id", nullable=False, ondelete="CASCADE", index=True
+    )
+    title: str = Field(max_length=REEL_TITLE_MAX_LENGTH)
+    edit: dict[str, Any] = Field(sa_column=Column(JSONB, nullable=False))  # ReelEdit
+    created_at: datetime = Field(
+        default_factory=get_datetime_utc, sa_type=DateTime(timezone=True)
+    )
+    # Set on every save; also the version token for stale-save checks (crud.update_reel)
+    updated_at: datetime = Field(
+        default_factory=get_datetime_utc, sa_type=DateTime(timezone=True)
+    )
+    # Soft delete: hidden from the API, kept in the database
+    deleted_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+class ReelCreate(SQLModel):
+    title: ReelTitle
+    edit: ReelEdit = Field(default_factory=ReelEdit)
+
+
+class ReelUpdate(SQLModel):
+    """Full replace of the title and edit list."""
+
+    title: ReelTitle
+    edit: ReelEdit
+    updated_at: AwareDatetime = Field(
+        description="The reel's updated_at as you loaded it. If it was saved "
+        "elsewhere since then, the save is refused (409, code reel_changed)"
+    )
+
+
+class ReelPublic(SQLModel):
+    id: uuid.UUID
+    video_id: uuid.UUID
+    owner_id: uuid.UUID
+    title: str
+    edit: ReelEdit
+    created_at: datetime
+    updated_at: datetime
+
+
+class ReelsPublic(SQLModel):
+    data: list[ReelPublic]
+    count: int
 
 
 class Health(SQLModel):

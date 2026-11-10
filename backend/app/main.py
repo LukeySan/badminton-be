@@ -3,6 +3,7 @@ from fastapi import FastAPI
 from fastapi.routing import APIRoute
 from starlette.middleware.cors import CORSMiddleware
 
+from app.api.errors import CodedHTTPException, coded_http_exception_handler
 from app.api.main import api_router
 from app.core.config import settings
 from app.core.upload_limit import UploadSizeLimit
@@ -31,6 +32,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.add_exception_handler(CodedHTTPException, coded_http_exception_handler)
 
 # The frontend lives in its own repo, so (unlike the template) nothing is served at "/".
 app.include_router(api_router, prefix=settings.API_V1_STR)

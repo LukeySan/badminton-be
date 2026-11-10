@@ -8,16 +8,20 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlmodel import Session
 
-from app import crud, media
+from app import crud, media, trajectory
 from app.api.deps import CurrentUser, SessionDep
+from app.api.errors import CodedHTTPException
 from app.core.config import settings
 from app.core.security import create_file_token, verify_file_token
 from app.core.upload_limit import format_bytes
 from app.models import (
     CourtUpdate,
+    ErrorCode,
+    ErrorWithCode,
     FileUrl,
     Message,
     RalliesPublic,
+    TrajectoryPublic,
     User,
     Video,
     VideoPublic,
@@ -28,6 +32,7 @@ router = APIRouter(prefix="/videos", tags=["videos"])
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 CHUNK = 1024 * 1024
+MAX_TRAJECTORY_SECONDS = 600  # per request: ~18,000 points at 30 fps
 
 # Handlers are plain `def` (not async): FastAPI runs them in a thread pool, so slow
 # file copies and ffmpeg calls don't block other requests.
@@ -277,6 +282,54 @@ def read_video_rallies(
     """
     video = get_video_for_user(session, current_user, id)
     return RalliesPublic(data=video.rallies, count=len(video.rallies))  # type: ignore[arg-type]
+
+
+@router.get(
+    "/{id}/trajectory",
+    response_model=TrajectoryPublic,
+    responses={
+        404: {
+            "model": ErrorWithCode,
+            "description": "code `trajectory_missing`: the video was analyzed before "
+            "trajectories were saved (or not analyzed yet); re-analyzing it adds one. "
+            "A video that doesn't exist gives a plain 404 without a code.",
+        },
+    },
+)
+def read_video_trajectory(
+    session: SessionDep,
+    current_user: CurrentUser,
+    id: uuid.UUID,
+    start: Annotated[float, Query(ge=0, description="Seconds")],
+    end: Annotated[float, Query(ge=0, description="Seconds")],
+) -> Any:
+    """
+    Shuttle positions for every frame from `start` to `end` (seconds), as fractions
+    of the frame like the court corners. For drawing the shuttle trail.
+    At most 600 seconds per request.
+    """
+    video = get_video_for_user(session, current_user, id)
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end must be after start")
+    if end - start > MAX_TRAJECTORY_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"At most {MAX_TRAJECTORY_SECONDS} seconds per request",
+        )
+    track = trajectory.load_trajectory(video.id)
+    if track is None:
+        raise CodedHTTPException(
+            404,
+            ErrorCode.TRAJECTORY_MISSING,
+            "This video has no shuttle trajectory yet; re-analyze it to enable "
+            "the shuttle trail",
+        )
+    return TrajectoryPublic(
+        fps=track.fps,
+        start=start,
+        end=end,
+        points=trajectory.points_between(track, start, end),
+    )
 
 
 @router.get("/{id}/file-url", response_model=FileUrl)

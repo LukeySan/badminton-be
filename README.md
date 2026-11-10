@@ -14,18 +14,20 @@ The API is built on the
 FastAPI, SQLModel, PostgreSQL, Alembic migrations, JWT login, pytest.
 
 > **Status: beta prototype.** Working end to end: upload → mark court → queue → the
-> worker finds the rallies → `GET /videos/{id}/rallies`. Not yet: rally corrections,
-> deployment.
+> worker finds the rallies → `GET /videos/{id}/rallies`, shuttle trajectory for trails,
+> reels (highlight edit lists). Not yet: rally corrections, deployment.
 
 ## Repo layout
 
 ```
 backend/             FastAPI API (the template's "app" package)
   app/
-    api/routes/        endpoints: login, users, utils, videos
+    api/routes/        endpoints: login, users, utils, health, videos, reels
+    api/errors.py      errors with a machine-readable code (trajectory_missing, ...)
     models.py          database tables + API input/output models (SQLModel)
     crud.py            database operations, incl. video status changes
     media.py           ffprobe/ffmpeg helpers (video info, frames)
+    trajectory.py      reads the per-video shuttle trajectory file
     core/              settings, database engine, password + token security
     alembic/versions/  database migrations
   tests/             pytest (incl. the worker loop, with a fake pipeline)
@@ -33,10 +35,11 @@ backend/             FastAPI API (the template's "app" package)
 worker/              processing: downscale → TrackNet shuttle tracking → rally detection
   run_worker.py        the job loop: claims queued videos, runs the pipeline
   pipeline.py          one video in, rallies out (also a CLI)
+  trajectory_file.py   writes the shuttle trajectory file the API serves
   tracknet/            TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/               model weights (not in git, see below)
 compose.yml          local Postgres, Adminer (DB browser), Mailpit (test emails)
-storage/             uploaded videos (created on first upload, not in git)
+storage/             per video: original, trajectory.json.gz, work/ (not in git)
 ```
 
 The API and worker share one repo (and one uv environment) because the worker uses the
@@ -110,6 +113,12 @@ own videos; the superuser sees all.
 | `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
 | `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again). At most 2 of a user's videos queued or processing at once (429) |
 | `GET /videos/{id}/rallies` | `{data: [{id, start, end, duration}], count}`, seconds |
+| `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved |
+| `GET /videos/{id}/reels` | The video's reels, most recently saved first: `{data, count}` |
+| `POST /videos/{id}/reels` | Create a reel `{title, edit}` (see Reels below) |
+| `GET /reels/{id}` | One reel with its edit list |
+| `PUT /reels/{id}` | Save: replaces title and edit list. Send the `updated_at` you loaded; 409 with `code: "reel_changed"` if it was saved elsewhere since |
+| `DELETE /reels/{id}` | Soft delete (hidden, row kept) |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
 
@@ -119,6 +128,33 @@ videos piling up with nothing processing means no worker is running.
 
 Plus the template's endpoints: login, password recovery, signup, `/users/me`, user
 admin, health check.
+
+**Error codes.** Errors are `{"detail": "..."}` as usual. The few the app reacts to with
+something other than showing the message also carry a `code`
+(`{"detail": "...", "code": "trajectory_missing"}`); match on the code, never the text.
+
+**Reels** are non-destructive highlight edits: the original video is never changed; a
+reel is an edit list the app plays back. All times are seconds in the original video.
+
+```jsonc
+{
+  "version": 1,
+  "view": "cut",            // "cut" (rallies only) or "full"
+  "format": "16:9",         // or "9:16"
+  "clips": [                // in reel order
+    {"rally_id": 271, "trim_start": 2.0, "trim_end": 5.0, "slow_mo": false}
+  ],
+  "restored_gaps": [{"start": 4.43, "end": 6.0}],   // breaks shown again in cut view
+  "overlays": {"trail": true, "captions": [{"text": "What a smash", "start": 3, "end": 4}]}
+}
+```
+
+Rejected with 422 (with the usual `loc`, e.g. `["body","edit","clips",0,"trim_end"]`):
+a `rally_id` that isn't one of the video's rallies, times past the end of the video
+(0.1 s tolerance) or with end before start, captions over 80 characters, unknown fields.
+`rally_id` may be `null` (a clip not tied to a rally). Re-analyzing a video gives its
+rallies new ids, so the worker re-links reel clips to the new rally covering the same
+time (or `null`) in the same transaction; the trims don't change.
 
 **Why `file-url`:** a browser `<video src="...">` can't send the `Authorization` header.
 Instead of putting the 8-day login token in a URL (where it ends up in logs and
@@ -203,7 +239,10 @@ same database:
   asleep) stops when it wakes up instead of overwriting the other worker's results.
 - **Ctrl+C** puts the current video straight back in the queue.
 
-Intermediate files go to `storage/<video id>/work/`.
+Intermediate files go to `storage/<video id>/work/`. The shuttle trajectory
+(`trajectory.json.gz`: per frame, visible + x/y as fractions, gzipped JSON, ~50 KB for
+21 minutes) is moved to `storage/<video id>/` just before the video is marked done, so
+"done" always comes with the new trajectory.
 
 **Log lines.** One line per phase, prefixed with the video's short id so jobs from
 several workers can be told apart:

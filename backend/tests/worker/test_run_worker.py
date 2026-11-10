@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import Engine
 from sqlmodel import Session, col, update
 
-from app import crud
+from app import crud, trajectory
 from app.models import FailureReason, Video
 from tests.crud.test_video_jobs import (  # noqa: F401  (empty_videos is a fixture)
     empty_videos,
@@ -333,3 +333,58 @@ def test_lost_job_is_logged(
     assert worker_lines(caplog)[-1] == (
         f"[{str(video_id)[:8]}] lost: results discarded, another worker has this job now"
     )
+
+
+def test_trajectory_is_moved_into_place_when_done(db: Session, engine: Engine) -> None:
+    video_id = make_video(db)
+    published = trajectory.trajectory_path(video_id)
+    seen_during_processing: list[bool] = []
+
+    def processor(
+        _path: Path,
+        _corners: list[list[float]],
+        work_dir: Path,
+        _progress: ProgressFn,
+        _log: LogFn,
+    ) -> list[dict[str, Any]]:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / trajectory.FILENAME).write_bytes(b"new trajectory")
+        seen_during_processing.append(published.exists())
+        return []
+
+    run(engine, processor)
+    assert seen_during_processing == [False]  # only published once finished
+    assert published.read_bytes() == b"new trajectory"
+    assert not (published.parent / "work" / trajectory.FILENAME).exists()
+    assert fetch(engine, video_id).status == "done"
+
+
+def test_failed_job_keeps_the_old_trajectory(db: Session, engine: Engine) -> None:
+    video_id = make_video(db)
+    published = trajectory.trajectory_path(video_id)
+    published.parent.mkdir(parents=True, exist_ok=True)
+    published.write_bytes(b"from the last run")
+
+    def processor(
+        _path: Path,
+        _corners: list[list[float]],
+        work_dir: Path,
+        _progress: ProgressFn,
+        _log: LogFn,
+    ) -> list[dict[str, Any]]:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / trajectory.FILENAME).write_bytes(b"half-finished run")
+        raise CourtNotVisible("shuttle inside the court zone in 0.0% of frames")
+
+    run(engine, processor)
+    assert fetch(engine, video_id).status == "failed"
+    assert published.read_bytes() == b"from the last run"
+
+
+def test_processor_without_a_trajectory_still_finishes(
+    db: Session, engine: Engine
+) -> None:
+    video_id = make_video(db)
+    run(engine, lambda *_: [{"start": 1.0, "end": 2.0}])
+    assert fetch(engine, video_id).status == "done"
+    assert not trajectory.trajectory_path(video_id).exists()

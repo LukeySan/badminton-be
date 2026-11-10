@@ -1,6 +1,6 @@
 import uuid
 from collections.abc import Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import extract, update
@@ -10,6 +10,8 @@ from app.core.security import get_password_hash, verify_password
 from app.models import (
     FailureReason,
     Rally,
+    Reel,
+    ReelEdit,
     User,
     UserCreate,
     UserUpdate,
@@ -319,12 +321,56 @@ def finish_video(
         session.rollback()
         return False
     session.exec(delete(Rally).where(col(Rally.video_id) == video_id))
-    session.add_all(
+    new_rallies = [
         Rally(video_id=video_id, start=start, end=end, source=source)
         for start, end in rallies
-    )
+    ]
+    session.add_all(new_rallies)
+    session.flush()  # assigns the new rally ids
+    _relink_reel_clips(session, video_id, new_rallies)
     session.commit()
     return True
+
+
+def relink_clips(
+    edit: dict[str, Any], rallies: Sequence[tuple[int, float, float]]
+) -> dict[str, Any]:
+    """A copy of a reel's edit list with every clip pointing at the given rally
+    (id, start, end) that overlaps its trimmed range most, or None if none does."""
+
+    def best(start: float, end: float) -> int | None:
+        overlaps = [(min(end, r_end) - max(start, r_start), r_id)
+                    for r_id, r_start, r_end in rallies]  # fmt: skip
+        overlap, rally_id = max(overlaps, default=(0.0, None), key=lambda o: o[0])
+        return rally_id if overlap > 0 else None
+
+    clips = [
+        {**clip, "rally_id": best(clip["trim_start"], clip["trim_end"])}
+        for clip in edit.get("clips", [])
+    ]
+    return {**edit, "clips": clips}
+
+
+def _relink_reel_clips(
+    session: Session, video_id: uuid.UUID, rallies: Sequence[Rally]
+) -> None:
+    """Re-analyzing replaces a video's rallies, so their ids change. Point reel clips
+    at the new rally covering the same time (the trims, in seconds, stay as they
+    are), so the reels still pass validation when the user saves them again.
+    FOR UPDATE: a user's save at the same moment waits, then gets a 409 (its
+    updated_at no longer matches) instead of overwriting this or being overwritten."""
+    spans = [(r.id, r.start, r.end) for r in rallies if r.id is not None]
+    reels = session.exec(
+        select(Reel)
+        .where(col(Reel.video_id) == video_id, col(Reel.deleted_at).is_(None))
+        .with_for_update()
+    ).all()
+    for reel in reels:
+        edit = relink_clips(reel.edit, spans)
+        if edit != reel.edit:
+            reel.edit = edit  # a new dict, so SQLAlchemy sees the change
+            reel.updated_at = get_datetime_utc()
+            session.add(reel)
 
 
 def fail_video(
@@ -420,3 +466,88 @@ def queue_stats(*, session: Session) -> tuple[int, int, float | None]:
         )
     ).one()
     return n_queued, n_processing, None if oldest is None else float(oldest)
+
+
+# --- Reels --------------------------------------------------------------------
+# Soft delete: deleted_at is set and the reel disappears from the API, but the row
+# stays (undo, support, and what people delete is useful to know later).
+
+
+def _live_reel(reel_id: uuid.UUID) -> tuple[Any, ...]:
+    return (col(Reel.id) == reel_id, col(Reel.deleted_at).is_(None))
+
+
+def video_rally_ids(*, session: Session, video_id: uuid.UUID) -> set[int]:
+    ids = session.exec(select(Rally.id).where(col(Rally.video_id) == video_id)).all()
+    return {i for i in ids if i is not None}
+
+
+def list_reels(
+    *, session: Session, video_id: uuid.UUID, skip: int = 0, limit: int = 100
+) -> tuple[Sequence[Reel], int]:
+    """A video's reels (not deleted), most recently saved first, and the total."""
+    live = (col(Reel.video_id) == video_id, col(Reel.deleted_at).is_(None))
+    reels = session.exec(
+        select(Reel)
+        .where(*live)
+        .order_by(col(Reel.updated_at).desc(), col(Reel.id))
+        .offset(skip)
+        .limit(limit)
+    ).all()
+    count = session.exec(select(func.count()).select_from(Reel).where(*live)).one()
+    return reels, count
+
+
+def create_reel(*, session: Session, video: Video, title: str, edit: ReelEdit) -> Reel:
+    now = get_datetime_utc()
+    reel = Reel(
+        video_id=video.id,
+        owner_id=video.owner_id,
+        title=title,
+        edit=edit.model_dump(mode="json"),
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(reel)
+    session.commit()
+    session.refresh(reel)
+    return reel
+
+
+def get_reel(*, session: Session, reel_id: uuid.UUID) -> Reel | None:
+    """The reel, or None if it doesn't exist or was deleted."""
+    return session.exec(select(Reel).where(*_live_reel(reel_id))).first()
+
+
+def update_reel(
+    *,
+    session: Session,
+    reel_id: uuid.UUID,
+    title: str,
+    edit: ReelEdit,
+    expected_updated_at: datetime,
+) -> bool:
+    """Replace the title and edit list, only if the reel is unchanged since the
+    caller loaded it (updated_at still matches; optimistic locking). One
+    conditional UPDATE, so two saves at once can't both pass the check.
+    False = changed since, or deleted."""
+    result = session.exec(
+        update(Reel)
+        .where(*_live_reel(reel_id), col(Reel.updated_at) == expected_updated_at)
+        .values(
+            title=title,
+            edit=edit.model_dump(mode="json"),
+            updated_at=get_datetime_utc(),
+        )
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+def soft_delete_reel(*, session: Session, reel_id: uuid.UUID) -> bool:
+    """False if the reel doesn't exist or was already deleted."""
+    result = session.exec(
+        update(Reel).where(*_live_reel(reel_id)).values(deleted_at=get_datetime_utc())
+    )
+    session.commit()
+    return result.rowcount == 1
