@@ -5,6 +5,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from app.api.main import api_router
 from app.core.config import settings
+from app.core.upload_limit import UploadSizeLimit
 
 
 def custom_generate_unique_id(route: APIRoute) -> str:
@@ -20,6 +21,9 @@ app = FastAPI(
     generate_unique_id_function=custom_generate_unique_id,
 )
 
+# Added before CORS on purpose: the middleware added last runs first, so CORS wraps
+# this one and the browser can read its 413 instead of seeing a CORS error.
+app.add_middleware(UploadSizeLimit)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_HOST],

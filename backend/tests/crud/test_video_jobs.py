@@ -9,7 +9,7 @@ from sqlmodel import Session, col, delete, func, select, update
 
 from app import crud
 from app.core.config import settings
-from app.models import Rally, Video
+from app.models import FailureReason, Rally, Video
 
 COURT = [[0.478, 0.347], [0.777, 0.369], [0.93, 0.943], [0.054, 0.781]]
 
@@ -243,10 +243,12 @@ def test_fail_records_the_error(db: Session, engine: Engine) -> None:
             session=session,
             video_id=video_id,
             claim_id=video.claim_id,
+            reason=FailureReason.VIDEO_UNREADABLE,
             error="RuntimeError: " + "x" * 5000,
         )
     failed = fetch(engine, video_id)
     assert failed.status == "failed"
+    assert failed.failure_reason == "Couldn't read this video"
     assert failed.error and failed.error.startswith("RuntimeError: x")
     assert len(failed.error) == crud.MAX_ERROR_LENGTH
     assert failed.claim_id is None
@@ -290,7 +292,7 @@ def test_old_claim_cannot_write_after_job_was_taken_over(
         kw = {"session": session, "video_id": video_id, "claim_id": a.claim_id}
         assert not crud.heartbeat_video(**kw, progress=0.9)
         assert not crud.finish_video(**kw, rallies=[(1.0, 2.0)])
-        assert not crud.fail_video(**kw, error="late")
+        assert not crud.fail_video(**kw, reason=FailureReason.UNKNOWN, error="late")
         assert not crud.release_video(**kw)
 
     now = fetch(engine, video_id)
@@ -340,15 +342,23 @@ def test_requeue_stale_videos(db: Session, engine: Engine) -> None:
     gave_up = fetch(engine, used_up)
     assert gave_up.status == "failed"
     assert gave_up.error and "stopped responding 3 times" in gave_up.error
+    assert gave_up.failure_reason == FailureReason.KEPT_STOPPING
     assert fetch(engine, old_queued).status == "queued"  # queued isn't "stale"
 
 
-def test_user_requeue_resets_attempts(db: Session, engine: Engine) -> None:
+def test_user_requeue_resets_attempts_and_failure(db: Session, engine: Engine) -> None:
     video_id = make_video(db, status="failed", attempts=3)
+    db.exec(
+        update(Video)
+        .where(col(Video.id) == video_id)
+        .values(failure_reason=FailureReason.UNKNOWN, error="boom")
+    )
+    db.commit()
     with Session(engine) as session:
-        assert crud.queue_video(session=session, video_id=video_id)
+        assert crud.queue_video(session=session, video_id=video_id) == "queued"
     queued = fetch(engine, video_id)
     assert (queued.status, queued.attempts) == ("queued", 0)
+    assert (queued.failure_reason, queued.error) == (None, None)
 
 
 # --- deleting vs. claiming ------------------------------------------------------
@@ -405,3 +415,54 @@ def test_delete_video_crud(db: Session, engine: Engine) -> None:
         assert crud.delete_video(session=session, video_id=queued)
         assert not crud.delete_video(session=session, video_id=processing)
         assert not crud.delete_video(session=session, video_id=uuid.uuid4())
+
+
+# --- videos in progress per user -------------------------------------------------
+
+
+def test_limit_holds_when_many_queue_at_once(db: Session, engine: Engine) -> None:
+    """One user clicks "process" on 6 videos at the same moment, limit 2: exactly
+    2 get queued. (Without the lock on the user row, each request could count 0-1
+    active videos and let more through.)"""
+    video_ids = [make_video(db, status="uploaded") for _ in range(6)]
+    start_together = threading.Barrier(len(video_ids))
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def click(video_id: uuid.UUID) -> None:
+        try:
+            with Session(engine) as session:
+                start_together.wait()
+                results.append(
+                    crud.queue_video(session=session, video_id=video_id, max_active=2)
+                )
+        except BaseException as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=click, args=(v,)) for v in video_ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors
+    assert sorted(results) == ["limit_reached"] * 4 + ["queued"] * 2
+
+
+def test_queue_video_results(db: Session, engine: Engine) -> None:
+    queued = make_video(db, status="queued")
+    fresh = make_video(db, status="uploaded")
+    with Session(engine) as session:
+        # already queued, at the limit: "not_allowed" (the more useful message)
+        assert crud.queue_video(session=session, video_id=queued, max_active=1) == (
+            "not_allowed"
+        )
+        assert crud.queue_video(session=session, video_id=fresh, max_active=1) == (
+            "limit_reached"
+        )
+        assert (
+            crud.queue_video(session=session, video_id=fresh, max_active=2) == "queued"
+        )
+        assert crud.queue_video(
+            session=session, video_id=uuid.uuid4(), max_active=2
+        ) == ("not_allowed")

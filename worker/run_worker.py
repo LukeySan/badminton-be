@@ -33,20 +33,60 @@ from sqlmodel import Session
 from app import crud
 from app.core.config import settings
 from app.core.db import engine as default_engine
+from app.models import FailureReason
 
 WORKER_DIR = Path(__file__).resolve().parent
-sys.path.insert(0, str(WORKER_DIR))  # for `import pipeline`
+sys.path.insert(0, str(WORKER_DIR))  # for `import pipeline`, `import job_errors`
+
+from job_errors import CourtNotVisible, PipelineError, VideoUnreadable  # noqa: E402
 
 HEARTBEAT_SECONDS = 5.0
 STALE_AFTER = timedelta(minutes=2)
 POLL_SECONDS = 5.0
+TRACKING_LOG_STEP = 10  # log tracking progress every 10%
 
 logger = logging.getLogger("worker")
 
-# (video file, corner fractions, work dir, on_progress(0-1)) -> [{start, end, ...}]
+# (video file, corner fractions, work dir, on_progress(0-1), log(line)) -> rallies
 Processor = Callable[
-    [Path, list[list[float]], Path, Callable[[float], None]], list[dict[str, Any]]
+    [Path, list[list[float]], Path, Callable[[float], None], Callable[[str], None]],
+    list[dict[str, Any]],
 ]
+
+# Pipeline errors -> what the user sees. Any other exception is a bug: UNKNOWN.
+FAILURE_REASONS: dict[type[PipelineError], FailureReason] = {
+    VideoUnreadable: FailureReason.VIDEO_UNREADABLE,
+    CourtNotVisible: FailureReason.COURT_NOT_VISIBLE,
+}
+
+
+def failure_reason(e: Exception) -> FailureReason:
+    for error_type, reason in FAILURE_REASONS.items():
+        if isinstance(e, error_type):
+            return reason
+    return FailureReason.UNKNOWN
+
+
+def fmt_duration(seconds: float) -> str:
+    minutes, secs = divmod(round(seconds), 60)
+    return f"{minutes}m{secs:02d}s" if minutes else f"{secs}s"
+
+
+class JobLog:
+    """One job's log lines, prefixed with the video's short id so they can be told
+    apart when several workers log at once:  [3f2a1c9e] tracking 40%"""
+
+    def __init__(self, video_id: uuid.UUID) -> None:
+        self.prefix = f"[{str(video_id)[:8]}]"
+
+    def info(self, message: str) -> None:
+        logger.info("%s %s", self.prefix, message)
+
+    def warning(self, message: str) -> None:
+        logger.warning("%s %s", self.prefix, message)
+
+    def exception(self, message: str) -> None:
+        logger.exception("%s %s", self.prefix, message)  # with traceback
 
 
 class JobLost(Exception):
@@ -58,6 +98,7 @@ def run_pipeline(
     corners: list[list[float]],
     work_dir: Path,
     on_progress: Callable[[float], None],
+    log: Callable[[str], None],
     batch_size: int = 4,
 ) -> list[dict[str, Any]]:
     # Imported here so torch/opencv only load when there's actually a job,
@@ -70,7 +111,7 @@ def run_pipeline(
         str(work_dir),
         batch_size=batch_size,
         on_progress=on_progress,
-        log=logger.info,
+        log=log,
     )
     return rallies
 
@@ -83,21 +124,33 @@ class Heartbeat(threading.Thread):
     """
 
     def __init__(
-        self, engine: Engine, video_id: uuid.UUID, claim_id: uuid.UUID, interval: float
+        self,
+        engine: Engine,
+        video_id: uuid.UUID,
+        claim_id: uuid.UUID,
+        interval: float,
+        log: JobLog,
     ) -> None:
         super().__init__(daemon=True, name=f"heartbeat-{video_id}")
         self.engine, self.video_id, self.claim_id = engine, video_id, claim_id
         self.interval = interval
+        self.log = log
         self.progress = 0.0
+        self.logged_percent = 0
         self.lost = threading.Event()
         self._stop_event = threading.Event()
 
     def on_progress(self, fraction: float) -> None:
-        """Pipeline callback. Raises JobLost to stop the pipeline early."""
+        """Pipeline callback (tracking progress 0-1). Raises JobLost to stop the
+        pipeline early."""
         if self.lost.is_set():
             raise JobLost
         # Tracking is ~all of the work; keep 100% for when the rallies are saved
         self.progress = 0.95 * fraction
+        percent = int(fraction * 100) // TRACKING_LOG_STEP * TRACKING_LOG_STEP
+        if percent > self.logged_percent:
+            self.logged_percent = percent
+            self.log.info(f"tracking {percent}%")
 
     def beat(self) -> None:
         try:
@@ -110,10 +163,9 @@ class Heartbeat(threading.Thread):
                 )
         except OperationalError:
             # Database briefly unreachable: keep working, try again next beat
-            logger.warning("Heartbeat failed for %s; retrying", self.video_id)
+            self.log.warning("heartbeat failed (database unreachable); retrying")
             return
         if not ours:
-            logger.warning("Lost job %s (re-queued or deleted)", self.video_id)
             self.lost.set()
 
     def run(self) -> None:
@@ -133,13 +185,20 @@ def process_one(
     stale_after: timedelta = STALE_AFTER,
 ) -> bool:
     """Rescue stale jobs, then claim and process one video.
-    Returns False if there was nothing to do."""
+    Returns False if there was nothing to do.
+
+    Logs one line per phase: claimed, prepared, tracking N%, detecting rallies,
+    then done / failed (with the reason) / lost / stopped."""
     with Session(engine) as session:
-        requeued, failed = crud.requeue_stale_videos(
+        requeued, gave_up = crud.requeue_stale_videos(
             session=session, stale_after=stale_after
         )
-        if requeued or failed:
-            logger.warning("Stale jobs: %d re-queued, %d failed", requeued, failed)
+        if requeued or gave_up:
+            logger.warning(
+                "stale jobs (worker stopped responding): %d re-queued, %d failed",
+                requeued,
+                gave_up,
+            )
         video = crud.claim_next_video(session=session, claimed_by=worker_name)
         if video is None:
             return False
@@ -147,37 +206,47 @@ def process_one(
         assert claim_id is not None
         video_path = settings.STORAGE_DIR / video.storage_path
         corners = video.court_corners
-        logger.info(
-            "Processing %s (%s, attempt %d)", video_id, video.filename, video.attempts
+        log = JobLog(video_id)
+        log.info(
+            f"claimed: {video.filename}, {(video.duration or 0) / 60:.1f} min, "
+            f"attempt {video.attempts}/{crud.MAX_ATTEMPTS}"
         )
 
     work_dir = settings.STORAGE_DIR / str(video_id) / "work"
-    heartbeat = Heartbeat(engine, video_id, claim_id, heartbeat_seconds)
+    heartbeat = Heartbeat(engine, video_id, claim_id, heartbeat_seconds, log)
     heartbeat.start()
     started = time.monotonic()
     try:
         if corners is None:
             raise ValueError("The video has no court corners")
-        rallies = processor(video_path, corners, work_dir, heartbeat.on_progress)
+        rallies = processor(
+            video_path, corners, work_dir, heartbeat.on_progress, log.info
+        )
     except JobLost:
         heartbeat.stop()
-        logger.warning("Stopped %s: another worker has it now", video_id)
+        log.warning("lost: another worker has this job now; stopped")
         return True
     except KeyboardInterrupt:
         heartbeat.stop()
         with Session(engine) as session:
             crud.release_video(session=session, video_id=video_id, claim_id=claim_id)
-        logger.info("Stopped; %s is back in the queue", video_id)
+        log.info("stopped (Ctrl+C); back in the queue")
         raise
     except Exception as e:
         heartbeat.stop()
-        logger.exception("Failed %s", video_id)
+        reason = failure_reason(e)
+        details = f"{type(e).__name__}: {e}"
+        if isinstance(e, PipelineError):
+            log.warning(f"failed: {reason} ({details})")
+        else:  # unexpected: a bug, so keep the traceback
+            log.exception(f"failed: {reason} ({details})")
         with Session(engine) as session:
             crud.fail_video(
                 session=session,
                 video_id=video_id,
                 claim_id=claim_id,
-                error=f"{type(e).__name__}: {e}",
+                reason=reason,
+                error=details,
             )
         return True
     heartbeat.stop()
@@ -190,14 +259,13 @@ def process_one(
             rallies=[(float(r["start"]), float(r["end"])) for r in rallies],
         )
     if saved:
-        logger.info(
-            "Done %s: %d rallies in %.0fs",
-            video_id,
-            len(rallies),
-            time.monotonic() - started,
+        play = sum(float(r["end"]) - float(r["start"]) for r in rallies)
+        log.info(
+            f"done: {len(rallies)} rallies ({play / 60:.1f} min of play) "
+            f"in {fmt_duration(time.monotonic() - started)}"
         )
     else:
-        logger.warning("Discarded results for %s: another worker has it now", video_id)
+        log.warning("lost: results discarded, another worker has this job now")
     return True
 
 
@@ -230,9 +298,10 @@ def main() -> None:
         corners: list[list[float]],
         work_dir: Path,
         on_progress: Callable[[float], None],
+        log: Callable[[str], None],
     ) -> list[dict[str, Any]]:
         return run_pipeline(
-            video_path, corners, work_dir, on_progress, batch_size=args.batch_size
+            video_path, corners, work_dir, on_progress, log, batch_size=args.batch_size
         )
 
     logger.info("Worker %s started, waiting for jobs", worker_name)

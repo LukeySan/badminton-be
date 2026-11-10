@@ -12,6 +12,7 @@ from app import crud, media
 from app.api.deps import CurrentUser, SessionDep
 from app.core.config import settings
 from app.core.security import create_file_token, verify_file_token
+from app.core.upload_limit import format_bytes
 from app.models import (
     CourtUpdate,
     FileUrl,
@@ -76,12 +77,25 @@ def read_videos(
     return VideosPublic(data=videos, count=count)
 
 
-@router.post("/", response_model=VideoPublic, status_code=201)
+@router.post(
+    "/",
+    response_model=VideoPublic,
+    status_code=201,
+    responses={
+        411: {"description": "No Content-Length header"},
+        413: {"description": "File larger than MAX_UPLOAD_BYTES (2 GB)"},
+        415: {"description": "Not a video file type"},
+        422: {
+            "description": "Video longer than MAX_VIDEO_MINUTES (60), or invalid form"
+        },
+    },
+)
 def upload_video(
     session: SessionDep, current_user: CurrentUser, file: UploadFile
 ) -> Any:
     """
     Upload a video (multipart, field `file`). Status starts as `uploaded`.
+    Limits: MAX_UPLOAD_BYTES (413) and MAX_VIDEO_MINUTES (422).
     """
     ext = Path(file.filename or "").suffix.lower()
     if ext not in VIDEO_EXTENSIONS:
@@ -96,12 +110,27 @@ def upload_video(
     video_dir = settings.STORAGE_DIR / str(video_id)
     video_dir.mkdir(parents=True)
     try:
+        size = 0
         with open(settings.STORAGE_DIR / storage_path, "wb") as out:
-            shutil.copyfileobj(
-                file.file, out, CHUNK
-            )  # chunked: never the whole video in memory
+            # Chunked: never the whole video in memory. Counted, because the
+            # middleware's Content-Length check includes the multipart wrapping.
+            while chunk := file.file.read(CHUNK):
+                size += len(chunk)
+                if size > settings.MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="The file is larger than the "
+                        f"{format_bytes(settings.MAX_UPLOAD_BYTES)} limit",
+                    )
+                out.write(chunk)
         # Reject non-videos now, not later in the worker
         info = media.probe(settings.STORAGE_DIR / storage_path)
+        if info["duration"] > settings.MAX_VIDEO_MINUTES * 60:
+            raise HTTPException(
+                status_code=422,
+                detail=f"The video is {info['duration'] / 60:.1f} minutes long; "
+                f"the limit is {settings.MAX_VIDEO_MINUTES:g} minutes",
+            )
     except ValueError as e:
         shutil.rmtree(video_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail=f"{file.filename}: {e}")
@@ -201,13 +230,33 @@ def update_video_court(
     return crud.get_video_public(session=session, video=video)
 
 
-@router.post("/{id}/process", response_model=VideoPublic)
+@router.post(
+    "/{id}/process",
+    response_model=VideoPublic,
+    responses={
+        409: {"description": "No court yet, or already queued/processing"},
+        429: {"description": "Too many of your videos queued or processing"},
+    },
+)
 def process_video(session: SessionDep, current_user: CurrentUser, id: uuid.UUID) -> Any:
     """
-    Queue the video for rally detection.
+    Queue the video for rally detection. At most MAX_ACTIVE_VIDEOS_PER_USER of a
+    user's videos can be queued or processing at once (429 beyond that).
     """
     video = get_video_for_user(session, current_user, id)
-    if not crud.queue_video(session=session, video_id=id):
+    result = crud.queue_video(
+        session=session,
+        video_id=id,
+        max_active=settings.MAX_ACTIVE_VIDEOS_PER_USER,
+    )
+    if result == "limit_reached":
+        n = settings.MAX_ACTIVE_VIDEOS_PER_USER
+        raise HTTPException(
+            status_code=429,
+            detail=f"You already have {n} video{'s' if n != 1 else ''} queued or "
+            "processing; try again when one has finished",
+        )
+    if result == "not_allowed":
         session.refresh(video)
         if video.court_corners is None:
             raise HTTPException(

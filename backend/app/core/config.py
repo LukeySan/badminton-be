@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # Signed links for streaming a video file (<video src> can't send a login header)
     FILE_TOKEN_EXPIRE_MINUTES: int = 60 * 12
 
+    # Beta limits
+    MAX_UPLOAD_BYTES: int = 2_000_000_000  # 2 GB, decimal, as phones show file sizes
+    MAX_VIDEO_MINUTES: float = 60
+    MAX_ACTIVE_VIDEOS_PER_USER: int = 2  # queued or processing at the same time
+
     @field_validator("DATABASE_URL", "TEST_DATABASE_URL", mode="before")
     @classmethod
     def _use_psycopg_driver(cls, value: str | PostgresDsn | None) -> str | None:
