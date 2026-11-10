@@ -1,6 +1,7 @@
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Annotated, Literal, Self
 
 from pydantic import EmailStr, computed_field, model_validator
@@ -78,6 +79,18 @@ class UsersPublic(SQLModel):
 # uploaded -> queued -> processing -> done | failed  (done/failed can be queued again)
 VideoStatus = Literal["uploaded", "queued", "processing", "done", "failed"]
 
+
+class FailureReason(StrEnum):
+    """Why a video failed, in words for the user (Video.failure_reason). The technical
+    details go to Video.error, which stays internal (it can contain server paths).
+    An enum so the frontend's generated types list every possible value."""
+
+    VIDEO_UNREADABLE = "Couldn't read this video"
+    COURT_NOT_VISIBLE = "Court not visible"
+    KEPT_STOPPING = "Processing kept stopping on this video"
+    UNKNOWN = "Something went wrong while processing this video"
+
+
 # Court corners are fractions of the displayed width/height (resolution independent);
 # pixels only exist inside the worker. 0-1 is inside the frame, but a corner may be
 # a little outside it (phone on a tripod; the court-tapping screen shows a gray margin
@@ -144,6 +157,8 @@ class Video(SQLModel, table=True):
     storage_path: str = Field(max_length=255)  # relative to settings.STORAGE_DIR
     status: str = Field(default="uploaded", max_length=20, index=True)
     progress: float = 0.0  # 0-1 while processing
+    # When failed: a FailureReason for the user, and the technical details (internal)
+    failure_reason: str | None = Field(default=None, max_length=255)
     error: str | None = Field(default=None, sa_type=Text)
     duration: float | None = None
     fps: float | None = None
@@ -184,7 +199,9 @@ class VideoPublic(SQLModel):
     filename: str
     status: VideoStatus
     progress: float
-    error: str | None
+    failure_reason: FailureReason | None = Field(
+        description="Why it failed, for the user (only when status is 'failed')"
+    )
     duration: float | None
     fps: float | None
     width: int | None
@@ -263,6 +280,18 @@ class Correction(SQLModel, table=True):
     created_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),
+    )
+
+
+class Health(SQLModel):
+    status: Literal["ok", "error"]
+    database: Literal["ok", "unreachable"]
+    queued: int | None = Field(default=None, description="Videos waiting for a worker")
+    processing: int | None = Field(default=None, description="Videos being processed")
+    oldest_queued_seconds: float | None = Field(
+        default=None,
+        description="How long the oldest queued video has waited (since it was "
+        "queued or re-queued); null when nothing is queued",
     )
 
 

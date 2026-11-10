@@ -1,13 +1,14 @@
 import uuid
 from collections.abc import Sequence
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 
-from sqlalchemy import update
+from sqlalchemy import extract, update
 from sqlmodel import Session, col, delete, func, select
 
 from app.core.security import get_password_hash, verify_password
 from app.models import (
+    FailureReason,
     Rally,
     User,
     UserCreate,
@@ -97,25 +98,61 @@ def set_video_court(
     return result.rowcount == 1
 
 
-def queue_video(*, session: Session, video_id: uuid.UUID) -> bool:
-    """Returns False if the video can't be queued right now (or doesn't exist)."""
+ACTIVE_STATUSES = ("queued", "processing")
+QueueResult = Literal["queued", "not_allowed", "limit_reached"]
+
+
+def queue_video(
+    *, session: Session, video_id: uuid.UUID, max_active: int | None = None
+) -> QueueResult:
+    """Queue a video for processing.
+
+    "not_allowed": wrong status, no court yet, or no such video.
+    "limit_reached": the owner already has max_active videos queued or processing.
+    The owner's user row is locked while counting, so two "process" clicks at the
+    same moment (two tabs, two videos) can't both see a count below the limit.
+    """
+    can_queue = (
+        col(Video.id) == video_id,
+        col(Video.status).in_(CAN_QUEUE_FROM),
+        col(Video.court_corners).is_not(None),
+    )
+    if max_active is not None:
+        owner_id = session.exec(
+            select(Video.owner_id).where(col(Video.id) == video_id)
+        ).first()
+        if owner_id is None:
+            return "not_allowed"
+        session.exec(
+            select(User.id).where(col(User.id) == owner_id).with_for_update()
+        ).one()
+        active = session.exec(
+            select(func.count())
+            .select_from(Video)
+            .where(
+                col(Video.owner_id) == owner_id,
+                col(Video.status).in_(ACTIVE_STATUSES),
+            )
+        ).one()
+        if active >= max_active:
+            # "Already queued" is the more useful answer when both apply
+            queueable = session.exec(select(Video.id).where(*can_queue)).first()
+            session.rollback()  # releases the lock
+            return "limit_reached" if queueable else "not_allowed"
     result = session.exec(
         update(Video)
-        .where(
-            col(Video.id) == video_id,
-            col(Video.status).in_(CAN_QUEUE_FROM),
-            col(Video.court_corners).is_not(None),
-        )
+        .where(*can_queue)
         .values(
             status="queued",
             progress=0.0,
+            failure_reason=None,
             error=None,
             attempts=0,
             updated_at=get_datetime_utc(),
         )
     )
     session.commit()
-    return result.rowcount == 1
+    return "queued" if result.rowcount == 1 else "not_allowed"
 
 
 def delete_video(*, session: Session, video_id: uuid.UUID) -> bool:
@@ -238,6 +275,7 @@ def claim_next_video(*, session: Session, claimed_by: str) -> Video | None:
         .values(
             status="processing",
             progress=0.0,
+            failure_reason=None,
             error=None,
             claim_id=uuid.uuid4(),
             claimed_by=claimed_by[:255],
@@ -290,14 +328,21 @@ def finish_video(
 
 
 def fail_video(
-    *, session: Session, video_id: uuid.UUID, claim_id: uuid.UUID, error: str
+    *,
+    session: Session,
+    video_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    reason: FailureReason,
+    error: str,
 ) -> bool:
-    """Mark the video failed with an error message. False = no longer ours."""
+    """Mark the video failed: `reason` is shown to the user, `error` (technical
+    details) stays internal. False = no longer ours."""
     result = session.exec(
         update(Video)
         .where(*_claimed(video_id, claim_id))
         .values(
             status="failed",
+            failure_reason=reason,
             error=error[:MAX_ERROR_LENGTH],
             claim_id=None,
             updated_at=func.now(),
@@ -343,6 +388,7 @@ def requeue_stale_videos(
         .where(*stale, col(Video.attempts) >= max_attempts)
         .values(
             status="failed",
+            failure_reason=FailureReason.KEPT_STOPPING,
             error=(
                 f"Processing stopped responding {max_attempts} times "
                 "(the worker crashed or lost its connection)."
@@ -358,3 +404,19 @@ def requeue_stale_videos(
     )
     session.commit()
     return requeued.rowcount, failed.rowcount
+
+
+def queue_stats(*, session: Session) -> tuple[int, int, float | None]:
+    """(queued, processing, seconds the oldest queued video has waited) in one
+    query. Uses the database clock, like the heartbeats."""
+    queued = col(Video.status) == "queued"
+    n_queued, n_processing, oldest = session.exec(
+        select(
+            func.count().filter(queued),
+            func.count().filter(col(Video.status) == "processing"),
+            extract(
+                "epoch", func.now() - func.min(col(Video.updated_at)).filter(queued)
+            ),
+        )
+    ).one()
+    return n_queued, n_processing, None if oldest is None else float(oldest)

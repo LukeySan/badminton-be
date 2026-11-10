@@ -13,7 +13,7 @@ from sqlmodel import Session, col, select, update
 from app import crud, media
 from app.core.config import settings
 from app.core.security import create_access_token, create_file_token
-from app.models import Rally, UserCreate, Video
+from app.models import FailureReason, Rally, UserCreate, Video
 from tests.utils.user import user_authentication_headers
 from tests.utils.utils import random_email, random_lower_string
 
@@ -649,7 +649,11 @@ def test_delete_race_with_another_delete(
     """Two deletes at once (double click): the one that loses gets 404, not 409."""
     real_delete = crud.delete_video
 
-    def deleted_first_by_someone_else(*, session: Session, video_id: uuid.UUID) -> bool:
+    def deleted_first_by_someone_else(
+        *,
+        session: Session,  # noqa: ARG001 (crud calls it by keyword)
+        video_id: uuid.UUID,
+    ) -> bool:
         with Session(db.get_bind()) as other:
             real_delete(session=other, video_id=video_id)
         return False
@@ -657,3 +661,171 @@ def test_delete_race_with_another_delete(
     monkeypatch.setattr(crud, "delete_video", deleted_first_by_someone_else)
     r = client.delete(f"{API}/{video['id']}", headers=normal_user_token_headers)
     assert r.status_code == 404
+
+
+# --- beta limits: upload size, duration, videos in progress per user ----------
+
+
+def test_upload_too_large_is_rejected_before_reading(
+    client: TestClient,
+    normal_user_token_headers: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Content-Length is over the limit: 413 from the middleware, before the body is
+    read (so it doesn't matter that this isn't even a video)."""
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", 1000)
+    big = tmp_path / "big.mp4"
+    big.write_bytes(b"\0" * 200_000)
+    before = stored_videos()
+    r = upload(client, normal_user_token_headers, big)
+    assert r.status_code == 413
+    assert r.json()["detail"] == "The file is 0.2 MB; the limit is 0.0 MB"
+    assert stored_videos() == before
+
+
+def test_upload_size_limit_is_exact(
+    client: TestClient,
+    normal_user_token_headers: dict[str, str],
+    sample_video: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Content-Length includes the multipart wrapping, so a file just over the limit
+    gets past the middleware; the route counts the bytes it saves."""
+    size = sample_video.stat().st_size
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", size - 1)
+    before = stored_videos()
+    r = upload(client, normal_user_token_headers, sample_video)
+    assert r.status_code == 413
+    assert "larger than the" in r.json()["detail"]
+    assert stored_videos() == before  # the partial file was removed
+
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", size)
+    assert upload(client, normal_user_token_headers, sample_video).status_code == 201
+
+
+def test_upload_without_content_length(
+    client: TestClient, normal_user_token_headers: dict[str, str]
+) -> None:
+    """A streamed (chunked) body has no Content-Length: its size can't be checked
+    up front, so it's refused."""
+    r = client.post(
+        f"{API}/",
+        headers={
+            **normal_user_token_headers,
+            "content-type": "multipart/form-data; boundary=x",
+        },
+        content=iter([b"--x\r\n", b"never read"]),
+    )
+    assert r.status_code == 411
+
+
+def test_upload_limit_errors_reach_the_browser(
+    client: TestClient,
+    normal_user_token_headers: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 413 must carry CORS headers, or the browser shows a CORS error instead of
+    the message (the middleware has to sit inside the CORS middleware)."""
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", 1000)
+    big = tmp_path / "big.mp4"
+    big.write_bytes(b"\0" * 200_000)
+    origin = settings.FRONTEND_HOST
+    with open(big, "rb") as f:
+        r = client.post(
+            f"{API}/",
+            headers={**normal_user_token_headers, "Origin": origin},
+            files={"file": ("big.mp4", f, "video/mp4")},
+        )
+    assert r.status_code == 413
+    assert r.headers["access-control-allow-origin"] == origin
+
+
+def test_other_posts_are_not_size_checked(
+    client: TestClient,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "MAX_UPLOAD_BYTES", 1)
+    r = client.put(
+        f"{API}/{video['id']}/court", headers=normal_user_token_headers, json=COURT
+    )
+    assert r.status_code == 200
+
+
+def test_upload_too_long(
+    client: TestClient,
+    normal_user_token_headers: dict[str, str],
+    sample_video: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "MAX_VIDEO_MINUTES", 0.04)  # 2.4 s; the video is 3 s
+    before = stored_videos()
+    r = upload(client, normal_user_token_headers, sample_video)
+    assert r.status_code == 422
+    assert (
+        r.json()["detail"] == "The video is 0.1 minutes long; the limit is 0.04 minutes"
+    )
+    assert stored_videos() == before
+
+
+def test_limit_on_videos_in_progress_per_user(
+    client: TestClient,
+    db: Session,
+    fresh_user_headers: dict[str, str],
+    other_user_headers: dict[str, str],
+    sample_video: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "MAX_ACTIVE_VIDEOS_PER_USER", 2)
+    h = fresh_user_headers
+    ids = [upload(client, h, sample_video).json()["id"] for _ in range(3)]
+    for vid in ids:
+        client.put(f"{API}/{vid}/court", headers=h, json=COURT)
+
+    assert client.post(f"{API}/{ids[0]}/process", headers=h).status_code == 200
+    set_status(db, ids[0], "processing")  # processing counts too
+    assert client.post(f"{API}/{ids[1]}/process", headers=h).status_code == 200
+
+    r = client.post(f"{API}/{ids[2]}/process", headers=h)
+    assert r.status_code == 429
+    assert r.json()["detail"] == (
+        "You already have 2 videos queued or processing; "
+        "try again when one has finished"
+    )
+    assert client.get(f"{API}/{ids[2]}", headers=h).json()["status"] == "uploaded"
+    # at the limit, an already-queued video still gets the more useful 409
+    r = client.post(f"{API}/{ids[1]}/process", headers=h)
+    assert (r.status_code, r.json()["detail"]) == (409, "Video is already queued")
+    # other users aren't affected
+    other = upload(client, other_user_headers, sample_video).json()["id"]
+    client.put(f"{API}/{other}/court", headers=other_user_headers, json=COURT)
+    r = client.post(f"{API}/{other}/process", headers=other_user_headers)
+    assert r.status_code == 200
+
+    set_status(db, ids[0], "done")  # one finished: room again
+    assert client.post(f"{API}/{ids[2]}/process", headers=h).status_code == 200
+
+
+def test_failed_video_shows_the_reason_not_the_internal_error(
+    client: TestClient,
+    db: Session,
+    video: dict[str, Any],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    db.exec(
+        update(Video)
+        .where(col(Video.id) == uuid.UUID(video["id"]))
+        .values(
+            status="failed",
+            failure_reason=FailureReason.COURT_NOT_VISIBLE,
+            error="CourtNotVisible: shuttle inside the court zone in 0.4% of frames",
+        )
+    )
+    db.commit()
+    body = client.get(f"{API}/{video['id']}", headers=normal_user_token_headers).json()
+    assert body["failure_reason"] == "Court not visible"
+    assert "error" not in body  # technical details stay internal
+    assert video["failure_reason"] is None  # not failed: no reason

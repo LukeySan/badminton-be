@@ -102,16 +102,20 @@ own videos; the superuser sees all.
 
 | Endpoint | What it does |
 |---|---|
-| `POST /videos/` | Upload a video (multipart, field `file`) |
+| `POST /videos/` | Upload a video (multipart, field `file`). Max 2 GB (413, refused before the upload is read; 411 without `Content-Length`) and 60 minutes (422) |
 | `GET /videos/` | Your videos, newest first: `{data, count}` (`count` = all of them, for paging with `skip`/`limit`). Superusers: `?all=true` for everyone's (403 for others) |
-| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning, `rally_count`, `play_seconds` (total rally time) |
+| `GET /videos/{id}` | Status `uploaded → queued → processing → done / failed`, progress, duration, fps, displayed width/height, court, `court_out_of_frame` warning, `rally_count`, `play_seconds` (total rally time), `failure_reason` when failed |
 | `DELETE /videos/{id}` | Delete a video with its rallies and files (yours, or any as a superuser). 409 while it's being processed |
 | `GET /videos/{id}/frame?t=1` | JPEG frame for marking the court |
 | `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
-| `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again) |
+| `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again). At most 2 of a user's videos queued or processing at once (429) |
 | `GET /videos/{id}/rallies` | `{data: [{id, start, end, duration}], count}`, seconds |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
+
+`GET /health` (no login): database reachable, number of queued and processing videos,
+and how long the oldest queued one has waited; 503 if the database is down. Queued
+videos piling up with nothing processing means no worker is running.
 
 Plus the template's endpoints: login, password recovery, signup, `/users/me`, user
 admin, health check.
@@ -150,6 +154,13 @@ Tests use a separate database, `app_test` (created by `scripts/initdb/` when the
 Postgres volume is first made), so they never touch your development data. Uploaded test
 videos go to a temporary folder. GitHub Actions runs lint + tests on every push to `main`
 and on pull requests, and fails below 90% coverage.
+
+The worker's own failure checks (unreadable video, court not visible) need OpenCV, which
+CI doesn't install; run them locally from the repo root:
+
+```bash
+uv run pytest worker/tests -q
+```
 
 ## Database changes (migrations)
 
@@ -194,6 +205,32 @@ same database:
 
 Intermediate files go to `storage/<video id>/work/`.
 
+**Log lines.** One line per phase, prefixed with the video's short id so jobs from
+several workers can be told apart:
+
+```
+[588c9f87] claimed: clipped_vid.mp4, 1.1 min, attempt 1/3
+[588c9f87] prepared: 1280x720, 30.00 fps, 1.1 min (downscale 6s)
+[588c9f87] tracking 10%        ... one line per 10%
+[588c9f87] detecting rallies (tracking took 41s)
+[588c9f87] done: 6 rallies (0.3 min of play) in 48s
+```
+
+or `failed: <reason> (<technical details>)`, `lost: ...` (another worker took over) or
+`stopped (Ctrl+C)`. Problems with the video are logged in one line; unexpected errors
+(bugs) also log their traceback.
+
+**Failure reasons.** A failed video gets a short `failure_reason` for the user, and the
+technical details in `error` (database and logs only, never in the API: it can contain
+server paths):
+
+| `failure_reason` | When |
+|---|---|
+| Couldn't read this video | ffmpeg/OpenCV can't decode it |
+| Court not visible | The shuttle is inside the marked court in under 5% of frames (real matches: 25-94%; wrong corners: 0-6%) |
+| Processing kept stopping on this video | The worker stopped responding 3 times on it |
+| Something went wrong while processing this video | Anything else (a bug: see the worker log) |
+
 ## Run the pipeline directly (no API)
 
 Useful for testing detection on one video. Takes about half the video's length on an
@@ -236,6 +273,9 @@ Settings come from `.env` (see `.env.example` for all of them). The main ones:
 | `STORAGE_DIR` | `storage/` | Uploaded videos |
 | `FRONTEND_HOST` | `http://localhost:5173` | Allowed by CORS (the Vite dev server) |
 | `FILE_TOKEN_EXPIRE_MINUTES` | 720 | How long `file-url` links work |
+| `MAX_UPLOAD_BYTES` | 2000000000 | Largest upload (2 GB, as phones count it) |
+| `MAX_VIDEO_MINUTES` | 60 | Longest video |
+| `MAX_ACTIVE_VIDEOS_PER_USER` | 2 | Videos one user can have queued or processing at once |
 
 `.env` is gitignored: never commit real secrets. With `FASTAPI_ENV=development` the
 `changethis` defaults only cause warnings; without it the app refuses to start with them.
