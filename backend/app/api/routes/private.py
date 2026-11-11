@@ -1,14 +1,17 @@
 import gzip
+import importlib.util
 import json
 import os
 import uuid
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-from app import crud, trajectory
+from app import crud, thumbnails, trajectory
 from app.api.deps import SessionDep
+from app.core.config import settings
 from app.core.security import get_password_hash
 from app.models import (
     User,
@@ -57,14 +60,32 @@ class PrivateTrajectory(BaseModel):
 class PrivateAnalysis(BaseModel):
     rallies: list[tuple[float, float]]
     trajectory: PrivateTrajectory | None = None
+    thumbnails: bool = Field(
+        default=False,
+        description="Make the thumbnail strip from the uploaded file (needs ffmpeg)",
+    )
+
+
+def _make_thumbnails(video: Video) -> None:
+    """The worker's thumbnail strip, from the uploaded file. Loaded from worker/ by
+    path: the API doesn't depend on the worker package (dev-only fixture)."""
+    source = Path(__file__).resolve().parents[4] / "worker" / "thumbnail_strip.py"
+    spec = importlib.util.spec_from_file_location("thumbnail_strip", source)
+    assert spec and spec.loader
+    strip = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(strip)
+    out = thumbnails.thumbnails_dir(video.id)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    strip.generate_thumbnails(str(settings.STORAGE_DIR / video.storage_path), str(out))
 
 
 @router.post("/videos/{id}/analysis", response_model=VideoPublic)
 def set_analysis(id: uuid.UUID, body: PrivateAnalysis, session: SessionDep) -> Any:
     """
     Test fixture: finish a video as the worker would, with these rallies (and
-    optionally a shuttle trajectory), without running the ML pipeline. Goes through
-    crud.finish_video like a real worker, so reel clips are re-linked the same way.
+    optionally a shuttle trajectory and the thumbnail strip), without running the ML
+    pipeline. Goes through crud.finish_video like a real worker, so reel clips are
+    re-linked the same way.
     """
     video = session.get(Video, id)
     if video is None:
@@ -82,6 +103,8 @@ def set_analysis(id: uuid.UUID, body: PrivateAnalysis, session: SessionDep) -> A
         with gzip.open(tmp, "wt") as fh:
             json.dump({"version": 1, **body.trajectory.model_dump()}, fh)
         os.replace(tmp, path)
+    if body.thumbnails:
+        _make_thumbnails(video)
     crud.finish_video(
         session=session, video_id=id, claim_id=claim_id, rallies=body.rallies
     )
