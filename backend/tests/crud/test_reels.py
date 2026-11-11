@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import Engine
-from sqlmodel import Session, col, select
+from sqlmodel import Session, col, select, update
 
 from app import crud
 from app.core.config import settings
@@ -34,41 +34,30 @@ def make_processing_video(
     return video, claim_id, [r.id for r in rallies if r.id is not None]
 
 
-def clip(rally_id: int | None, start: float, end: float) -> dict[str, object]:
+def clip(rally_id: int, *pieces: tuple[float, float]) -> dict[str, object]:
     return {
         "rally_id": rally_id,
-        "trim_start": start,
-        "trim_end": end,
-        "slow_mo": False,
+        "pieces": [{"start": s, "end": e, "slow_mo": False} for s, e in pieces],
     }
 
 
-def test_relink_clips_picks_the_rally_overlapping_most() -> None:
-    rallies = [(1, 10.0, 20.0), (2, 30.0, 45.0)]
-    edit = {
-        "version": 1,
-        "view": "cut",
-        "clips": [
-            clip(7, 9.0, 21.0),  # covers rally 1
-            {**clip(8, 29.0, 46.0), "slow_mo": True},  # rally 2; slow_mo kept
-            clip(9, 18.0, 31.0),  # 2 s of rally 1, 1 s of rally 2
-            clip(10, 50.0, 55.0),  # no rally there any more
-            clip(None, 20.0, 30.0),  # touches both, overlaps neither
-        ],
-    }
-    relinked = crud.relink_clips(edit, rallies)
-    relinked_ids = [c["rally_id"] for c in relinked["clips"]]
-    assert relinked_ids == [1, 2, 1, None, None]
-    assert relinked["clips"][1]["slow_mo"] is True
-    assert relinked["view"] == "cut"
-    assert edit["clips"][0]["rally_id"] == 7  # the input isn't changed
-
-
-def test_reanalysis_relinks_reel_clips(db: Session, engine: Engine) -> None:
-    """Re-analyzing replaces the rallies (new ids); reels must keep working."""
-    video, claim_id, old_ids = make_processing_video(db, [(10.0, 20.0), (30.0, 45.0)])
+def test_reanalysis_moves_reel_clips_to_the_new_rallies(
+    db: Session, engine: Engine
+) -> None:
+    """Re-analyzing replaces the rallies (new ids, slightly different bounds): each
+    clip moves to the new rally overlapping it most and is trimmed to its bounds;
+    a clip whose rally is gone is dropped."""
+    video, claim_id, old_ids = make_processing_video(
+        db, [(10.0, 20.0), (30.0, 45.0), (60.0, 70.0)]
+    )
     edit = ReelEdit.model_validate(
-        {"clips": [clip(old_ids[1], 29.0, 46.0), clip(old_ids[0], 9.0, 21.0)]}
+        {
+            "clips": [
+                clip(old_ids[1], (29.0, 35.0), (40.0, 46.0)),
+                clip(old_ids[0], (9.0, 21.0)),
+                clip(old_ids[2], (61.0, 65.0)),  # no rally there after re-analysis
+            ]
+        }
     )
     reel = crud.create_reel(session=db, video=video, title="r", edit=edit)
     deleted = crud.create_reel(session=db, video=video, title="d", edit=edit)
@@ -81,31 +70,40 @@ def test_reanalysis_relinks_reel_clips(db: Session, engine: Engine) -> None:
             session=session,
             video_id=video.id,
             claim_id=claim_id,
-            rallies=[(10.5, 19.0), (31.0, 44.0), (60.0, 70.0)],
+            rallies=[(10.5, 19.0), (31.0, 44.0)],
         )
 
-    new_ids = {
-        (r.start, r.end): r.id
+    new = {
+        (r.start, r.end): r
         for r in db.exec(select(Rally).where(col(Rally.video_id) == video.id)).all()
     }
-    assert not set(old_ids) & set(new_ids.values())
+    assert not set(old_ids) & {r.id for r in new.values()}
+    # The detector's bounds are recorded with the rallies
+    assert all((r.detected_start, r.detected_end) == key for key, r in new.items())
     db.expire_all()
-    relinked = db.get(Reel, reel.id)
-    assert relinked
-    assert [c["rally_id"] for c in relinked.edit["clips"]] == [
-        new_ids[(31.0, 44.0)],
-        new_ids[(10.5, 19.0)],
-    ]
-    assert [c["trim_start"] for c in relinked.edit["clips"]] == [29.0, 9.0]  # unchanged
-    # The relinked reel counts as changed (an editor that had it open must reload);
-    # untouched ones keep their updated_at
-    assert relinked.updated_at > saved_at[reel.id]
+    moved = db.get(Reel, reel.id)
+    assert moved
+    second, first = new[(31.0, 44.0)].id, new[(10.5, 19.0)].id
+    assert (
+        ReelEdit.model_validate(moved.edit).clips
+        == ReelEdit.model_validate(
+            {
+                "clips": [
+                    clip(second, (30.0, 35.0), (40.0, 45.0)),
+                    clip(first, (9.5, 20.0)),
+                ]
+            }
+        ).clips
+    )
+    # Moved reels count as changed (an open editor must reload); others don't
+    assert moved.updated_at > saved_at[reel.id]
     still_deleted, untouched = db.get(Reel, deleted.id), db.get(Reel, empty.id)
     assert still_deleted and still_deleted.edit["clips"][0]["rally_id"] == old_ids[1]
     assert untouched and untouched.updated_at == saved_at[empty.id]
-    # ...and the relinked reel passes validation again
-    assert not ReelEdit.model_validate(relinked.edit).problems(
-        duration=120.0, rally_ids=set(new_ids.values())
+    # ...and the moved reel passes validation again
+    assert not ReelEdit.model_validate(moved.edit).problems(
+        duration=120.0,
+        rallies={r.id: (r.start, r.end) for r in new.values() if r.id is not None},
     )
 
 
@@ -137,3 +135,38 @@ def test_simultaneous_saves_only_one_wins(db: Session, engine: Engine) -> None:
     for t in threads:
         t.join()
     assert sorted(results) == [False] * 5 + [True]
+
+
+def test_simultaneous_corrections_are_serialized(db: Session, engine: Engine) -> None:
+    """Four "add rally 21-25 s" at once: the video row lock makes them run one after
+    the other, so only the first passes the overlap check (409 for the rest)."""
+    video, _, _ = make_processing_video(db, [(10.0, 20.0)])
+    db.exec(update(Video).where(col(Video.id) == video.id).values(status="done"))
+    db.commit()
+    owner_id = video.owner_id
+    results: list[str] = []
+    barrier = threading.Barrier(4)
+
+    def add() -> None:
+        with Session(engine) as session:
+            barrier.wait()
+            try:
+                crud.add_rally(
+                    session=session,
+                    video_id=video.id,
+                    user_id=owner_id,
+                    start=21.0,
+                    end=25.0,
+                )
+                results.append("added")
+            except crud.CorrectionRefused as e:
+                results.append(str(e.status_code))
+
+    threads = [threading.Thread(target=add) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == ["409", "409", "409", "added"]
+    rallies = db.exec(select(Rally).where(col(Rally.video_id) == video.id)).all()
+    assert len(rallies) == 2

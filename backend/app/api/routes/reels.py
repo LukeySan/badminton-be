@@ -36,8 +36,9 @@ router = APIRouter(tags=["reels"])
 INVALID_EDIT: dict[int | str, dict[str, Any]] = {
     422: {
         "description": "Invalid edit list, including checks against the video: a "
-        "rally_id that isn't one of its rallies, or times past its end. Errors have "
-        'the usual `loc`, e.g. ["body", "edit", "clips", 2, "trim_end"]'
+        "rally_id that isn't one of its rallies, pieces outside their rally's bounds "
+        "(+ lead_in/lead_out), times past its end. Errors have the usual `loc`, e.g. "
+        '["body", "edit", "clips", 2, "pieces", 0, "end"]'
     }
 }
 
@@ -52,12 +53,16 @@ def get_reel_for_user(session: Session, current_user: User, reel_id: uuid.UUID) 
 
 def check_edit_against_video(session: Session, video: Video, edit: ReelEdit) -> None:
     """The checks Pydantic can't do alone, because they need the video's rallies
-    and duration. Reported in the same 422 format as Pydantic's, all at once."""
+    and duration. Reported in the same 422 format as Pydantic's, all at once.
+    Locks the video row (shared) first, so rallies can't change between this check
+    and the save (see crud.lock_video_for_reel_save)."""
+    crud.lock_video_for_reel_save(session=session, video_id=video.id)
     problems = edit.problems(
         duration=video.duration,
-        rally_ids=crud.video_rally_ids(session=session, video_id=video.id),
+        rallies=crud.video_rally_bounds(session=session, video_id=video.id),
     )
     if problems:
+        session.rollback()
         raise RequestValidationError(
             [
                 {"type": "value_error", "loc": ("body", "edit", *loc), "msg": msg}
@@ -94,7 +99,8 @@ def create_reel(
     session: SessionDep, current_user: CurrentUser, id: uuid.UUID, reel_in: ReelCreate
 ) -> Any:
     """
-    Create a reel for a video. It belongs to the video's owner.
+    Create a reel for a video. It belongs to the video's owner. Clips without
+    pieces are dropped.
     """
     video = get_video_for_user(session, current_user, id)
     check_edit_against_video(session, video, reel_in.edit)
@@ -120,8 +126,8 @@ def read_reel(
         409: {
             "model": ErrorWithCode,
             "description": "code `reel_changed`: saved elsewhere (another tab or "
-            "device) since you loaded it, or its clips were re-linked after the "
-            "video was re-analyzed. Load it again.",
+            "device) since you loaded it, or adjusted to a rally correction or "
+            "re-analysis. Load it again.",
         },
         **INVALID_EDIT,
     },
@@ -133,8 +139,9 @@ def update_reel(
     reel_in: ReelUpdate,
 ) -> Any:
     """
-    Save a reel: replaces the title and the whole edit list. Send the `updated_at`
-    you loaded; if the reel was saved since, nothing changes and you get 409.
+    Save a reel: replaces the title and the whole edit list (clips without pieces
+    are dropped). Send the `updated_at` you loaded; if the reel was saved since,
+    nothing changes and you get 409.
     """
     reel = get_reel_for_user(session, current_user, reel_id)
     video = session.get(Video, reel.video_id)
