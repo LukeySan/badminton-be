@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from sqlalchemy import extract, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, col, delete, func, select
 
 from app.core.security import get_password_hash, verify_password
@@ -521,20 +522,67 @@ def list_reels(
     return reels, count
 
 
-def create_reel(*, session: Session, video: Video, title: str, edit: ReelEdit) -> Reel:
+def create_reel(
+    *, session: Session, video: Video, title: str, edit: ReelEdit
+) -> Reel | None:
+    """Create the video's reel; None if it already has one (one per video).
+    INSERT ... ON CONFLICT DO NOTHING on the partial unique index: of two creates at
+    the same moment exactly one inserts, the other gets None (no error, no retry)."""
     now = get_datetime_utc()
-    reel = Reel(
-        video_id=video.id,
-        owner_id=video.owner_id,
-        title=title,
-        edit=edit.without_empty_clips().model_dump(mode="json"),
-        created_at=now,
-        updated_at=now,
-    )
-    session.add(reel)
+    reel_id = session.exec(
+        pg_insert(Reel)
+        .values(
+            id=uuid.uuid4(),
+            video_id=video.id,
+            owner_id=video.owner_id,
+            title=title,
+            edit=edit.without_empty_clips().model_dump(mode="json"),
+            created_at=now,
+            updated_at=now,
+        )
+        .on_conflict_do_nothing(
+            index_elements=[col(Reel.video_id)],
+            index_where=col(Reel.deleted_at).is_(None),
+        )
+        .returning(col(Reel.id))
+    ).first()
     session.commit()
+    return None if reel_id is None else session.get(Reel, reel_id[0])
+
+
+def get_video_reel(*, session: Session, video_id: uuid.UUID) -> Reel | None:
+    """The video's reel (not deleted), or None."""
+    return session.exec(
+        select(Reel).where(
+            col(Reel.video_id) == video_id, col(Reel.deleted_at).is_(None)
+        )
+    ).first()
+
+
+def save_video_reel(
+    *,
+    session: Session,
+    video: Video,
+    title: str,
+    edit: ReelEdit,
+    expected_updated_at: datetime | None,
+) -> tuple[Reel | None, bool]:
+    """Create (expected_updated_at None) or update the video's reel, only if it is
+    as the caller last saw it: none yet, or unchanged since it was loaded.
+    Returns (reel, created); reel None = it changed meanwhile (stale save)."""
+    if expected_updated_at is None:
+        return create_reel(session=session, video=video, title=title, edit=edit), True
+    reel = get_video_reel(session=session, video_id=video.id)
+    if reel is None or not update_reel(
+        session=session,
+        reel_id=reel.id,
+        title=title,
+        edit=edit,
+        expected_updated_at=expected_updated_at,
+    ):
+        return None, False
     session.refresh(reel)
-    return reel
+    return reel, False
 
 
 def get_reel(*, session: Session, reel_id: uuid.UUID) -> Reel | None:

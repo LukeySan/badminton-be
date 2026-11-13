@@ -101,13 +101,16 @@ def create(
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> CreateFn:
-    """create(title=..., edit=...) -> the new reel (asserts 201)."""
+    """create(title=..., edit=...) -> the video's new reel, made with
+    PUT /videos/{id}/reel (asserts 201)."""
 
-    def _create(title: str = "Best rallies", **body: Any) -> dict[str, Any]:
-        r = client.post(
-            f"{API}/videos/{video[0]}/reels",
+    def _create(
+        title: str = "Best rallies", edit: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        r = client.put(
+            f"{API}/videos/{video[0]}/reel",
             headers=normal_user_token_headers,
-            json={"title": title, **body},
+            json={"title": title, "edit": edit or {}, "updated_at": None},
         )
         assert r.status_code == 201, r.text
         data: dict[str, Any] = r.json()
@@ -183,44 +186,27 @@ def test_reel_belongs_to_the_video_owner_even_when_a_superuser_makes_it(
     assert r.status_code == 200
 
 
-def test_list_reels_most_recently_saved_first(
+def test_deprecated_list_has_the_one_live_reel(
     client: TestClient,
     db: Session,
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
     create: CreateFn,
 ) -> None:
-    first, second, deleted = create("First"), create("Second"), create("Deleted")
-    client.delete(f"{API}/reels/{deleted['id']}", headers=normal_user_token_headers)
+    h = normal_user_token_headers
+    first = create("First")
+    client.delete(f"{API}/reels/{first['id']}", headers=h)
+    second = create("Second")  # possible again once the first is deleted
     other_video, _ = make_video(db, settings.EMAIL_TEST_USER)
-    client.post(
-        f"{API}/videos/{other_video}/reels",
-        headers=normal_user_token_headers,
-        json={"title": "Other video's reel"},
+    client.put(
+        f"{API}/videos/{other_video}/reel",
+        headers=h,
+        json={"title": "Other video's reel", "edit": {}},
     )
-    # Saving `first` again moves it to the top
-    r = client.put(
-        f"{API}/reels/{first['id']}",
-        headers=normal_user_token_headers,
-        json={
-            "title": "First",
-            "edit": first["edit"],
-            "updated_at": first["updated_at"],
-        },
-    )
+    r = client.get(f"{API}/videos/{video[0]}/reels", headers=h)
     assert r.status_code == 200
-
-    r = client.get(f"{API}/videos/{video[0]}/reels", headers=normal_user_token_headers)
-    assert r.status_code == 200
-    assert [reel["title"] for reel in r.json()["data"]] == ["First", "Second"]
-    assert r.json()["count"] == 2
-
-    r = client.get(
-        f"{API}/videos/{video[0]}/reels?limit=1", headers=normal_user_token_headers
-    )
-    assert [reel["id"] for reel in r.json()["data"]] == [first["id"]]
-    assert r.json()["count"] == 2  # the total, not the page size
-    assert second["id"] != first["id"]
+    assert [reel["id"] for reel in r.json()["data"]] == [second["id"]]
+    assert r.json()["count"] == 1
 
 
 # --- update -----------------------------------------------------------------
@@ -466,8 +452,8 @@ def test_invalid_edit_is_rejected(
         for c in edit.get("clips", [])
     ]
     body = {**edit, "clips": clips} if "clips" in edit else edit
-    r = client.post(
-        f"{API}/videos/{video[0]}/reels",
+    r = client.put(
+        f"{API}/videos/{video[0]}/reel",
         headers=normal_user_token_headers,
         json={"title": "x", "edit": body},
     )
@@ -483,8 +469,8 @@ def test_rally_of_another_video_is_rejected(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     _, other_rallies = make_video(db, settings.EMAIL_TEST_USER)
-    r = client.post(
-        f"{API}/videos/{video[0]}/reels",
+    r = client.put(
+        f"{API}/videos/{video[0]}/reel",
         headers=normal_user_token_headers,
         json={"title": "x", "edit": {"clips": [clip(other_rallies[0], piece(10, 12))]}},
     )
@@ -506,8 +492,8 @@ def test_all_problems_are_reported_at_once(
         ],
         "overlays": {"captions": [{"text": "x", "start": 1, "end": 500}]},
     }
-    r = client.post(
-        f"{API}/videos/{video[0]}/reels",
+    r = client.put(
+        f"{API}/videos/{video[0]}/reel",
         headers=normal_user_token_headers,
         json={"title": "x", "edit": edit},
     )
@@ -551,13 +537,14 @@ def test_limits_that_are_allowed(
     assert len(reel["edit"]["clips"]) == 3
     # A rally near the end of the video: past its 3 s lead-out, the end of the
     # video is the limit (with the 0.1 s player tolerance)
-    late = Rally(video_id=video[0], start=110.0, end=119.0)
+    late_video, _ = make_video(db, settings.EMAIL_TEST_USER)
+    late = Rally(video_id=late_video, start=110.0, end=119.0)
     db.add(late)
     db.commit()
     for end, status in [(DURATION + 0.05, 201), (DURATION + 0.5, 422)]:
         late_clip = clip(late.id or 0, piece(112, end))
-        r = client.post(
-            f"{API}/videos/{video[0]}/reels",
+        r = client.put(
+            f"{API}/videos/{late_video}/reel",
             headers=normal_user_token_headers,
             json={"title": "x", "edit": {"lead_out": 3, "clips": [late_clip]}},
         )
@@ -572,8 +559,8 @@ def test_title_length(
     normal_user_token_headers: dict[str, str],
     title: str,
 ) -> None:
-    r = client.post(
-        f"{API}/videos/{video[0]}/reels",
+    r = client.put(
+        f"{API}/videos/{video[0]}/reel",
         headers=normal_user_token_headers,
         json={"title": title},
     )

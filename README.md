@@ -125,11 +125,9 @@ own videos; the superuser sees all.
 | `GET /videos/{id}/thumbnails-url` | Signed links (12 h) to the thumbnail strip: `{index_url, sheet_urls, expires_at}`. 404 with `code: "thumbnails_missing"` before it exists |
 | `GET /videos/{id}/thumbnails/{name}?token=...` | `index.json` or a sheet (`sheet_000.jpg`) |
 | `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved. Still saved for every video; nothing in the app depends on it now |
-| `GET /videos/{id}/reels` | The video's reels, most recently saved first: `{data, count}` |
-| `POST /videos/{id}/reels` | Create a reel `{title, edit}` (see Reels below) |
-| `GET /reels/{id}` | One reel with its edit list |
-| `PUT /reels/{id}` | Save: replaces title and edit list. Send the `updated_at` you loaded; 409 with `code: "reel_changed"` if it was saved elsewhere since |
-| `DELETE /reels/{id}` | Soft delete (hidden, row kept) |
+| `GET /videos/{id}/reel` | The video's reel (one per video), or 404 with `code: "reel_missing"` if it has none yet |
+| `PUT /videos/{id}/reel` | Create or save it: `{title, edit, updated_at}`. `updated_at: null` creates it (201); the `updated_at` you loaded updates it (200, replaces title and edit list). Anything else (it now exists, changed or was deleted meanwhile): 409 with `code: "reel_changed"`, reload |
+| *deprecated* `GET /videos/{id}/reels`, `POST /videos/{id}/reels`, `GET`/`PUT`/`DELETE /reels/{id}` | The old several-reels-per-video API, kept until the frontend has switched. `POST` is now get-or-create: it returns the existing reel (200) instead of making a second one |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
 
@@ -146,6 +144,8 @@ something other than showing the message also carry a `code`
 
 **Reels** are non-destructive highlight edits: the original video is never changed; a
 reel is an edit list the app plays back. All times are seconds in the original video.
+For the beta a video has one reel (enforced by the database: a unique index on
+`video_id` over reels that aren't deleted).
 
 ```jsonc
 {

@@ -20,6 +20,7 @@ def load(revision: str) -> ModuleType:
 
 
 reel_v2 = load("6acbb05a9b0b")
+one_reel = load("9bd7ddc4eed1")
 RALLIES = {1: (10.0, 20.0), 2: (30.0, 45.0)}
 
 
@@ -132,3 +133,24 @@ def test_downgrade_turns_pieces_back_into_one_trim() -> None:
 def test_round_trip_of_a_plain_v1_reel() -> None:
     old = v1(trim(2, 30, 44), trim(1, 9.5, 20.5, slow_mo=True))
     assert reel_v2.edit_v2_to_v1(reel_v2.edit_v1_to_v2(old, RALLIES)) == old
+
+
+def test_one_reel_per_video_keeps_the_most_recently_updated() -> None:
+    from datetime import UTC, datetime
+    from uuid import UUID
+
+    def t(hour: int) -> datetime:
+        return datetime(2026, 11, 12, hour, tzinfo=UTC)
+
+    v1, v2, v3 = (UUID(int=n) for n in (1, 2, 3))
+    r = [UUID(int=100 + n) for n in range(6)]
+    live = [
+        (r[0], v1, t(10), t(9)),
+        (r[1], v1, t(12), t(8)),  # v1: most recently updated -> kept
+        (r[2], v1, t(11), t(11)),
+        (r[3], v2, t(10), t(9)),  # v2: the only one -> kept
+        (r[4], v3, t(10), t(9)),
+        (r[5], v3, t(10), t(10)),  # v3: same updated_at -> the newer one is kept
+    ]
+    assert sorted(one_reel.reels_to_retire(live)) == sorted([r[0], r[2], r[4]])
+    assert one_reel.reels_to_retire([]) == []
