@@ -98,6 +98,23 @@ def delete_rally(
     )
 
 
+@router.post("/{rally_id}/confirm", response_model=RallyChange, responses=REFUSALS)
+def confirm_rally(
+    session: SessionDep, current_user: CurrentUser, id: uuid.UUID, rally_id: int
+) -> Any:
+    """
+    "Yes, that's a rally": clears `is_maybe` on a rally the detector was unsure
+    about. Logged as a correction (a training label). No-op for other rallies.
+    To answer "no", delete the rally.
+    """
+    get_video_for_user(session, current_user, id)
+    return run(
+        lambda: crud.confirm_rally(
+            session=session, video_id=id, user_id=current_user.id, rally_id=rally_id
+        )
+    )
+
+
 @router.post("/{rally_id}/split", response_model=RallyChange, responses=REFUSALS)
 def split_rally(
     session: SessionDep,

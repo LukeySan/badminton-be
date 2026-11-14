@@ -78,13 +78,16 @@ def fmt(seconds):
 
 
 def rule_detect(csv_path, video_path, court_path=None, margin=40, min_speed=0.005, gap=2.0,
-                still=0.4, still_speed=0.35, min_length=2.0):
+                still=0.4, still_speed=0.35, min_length=2.0, fps=None):
     """Run the hand-written rules and return per-frame signals plus rally segments.
-    Used by this script and, as extra features, by rally_model.py (the hybrid)."""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    video_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    cap.release()
+    Used by this script and, as extra features, by rally_model.py (the hybrid).
+    Pass fps (with a court) to skip opening the video, e.g. when only the CSV is kept."""
+    video_w = None
+    if fps is None or not court_path:
+        cap = cv2.VideoCapture(video_path)
+        fps = fps or cap.get(cv2.CAP_PROP_FPS)
+        video_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+        cap.release()
     if not fps or fps <= 0:
         raise SystemExit(f"Couldn't read the frame rate of {video_path}; check the video path.")
 

@@ -1,0 +1,122 @@
+{
+  "v1": {
+    "version": "v1",
+    "matches": {
+      "match1": {
+        "labeled": 5,
+        "shown": 6,
+        "missed": 0,
+        "fake": 1,
+        "confident_fake": 1,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 2,
+        "accurate_2s": 4
+      },
+      "match3": {
+        "labeled": 38,
+        "shown": 47,
+        "missed": 4,
+        "fake": 13,
+        "confident_fake": 13,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 24,
+        "accurate_2s": 27
+      },
+      "match4": {
+        "labeled": 26,
+        "shown": 29,
+        "missed": 3,
+        "fake": 6,
+        "confident_fake": 6,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 13,
+        "accurate_2s": 18
+      },
+      "match5": {
+        "labeled": 72,
+        "shown": 75,
+        "missed": 10,
+        "fake": 13,
+        "confident_fake": 13,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 30,
+        "accurate_2s": 51
+      }
+    },
+    "total": {
+      "labeled": 141,
+      "shown": 157,
+      "missed": 17,
+      "fake": 33,
+      "confident_fake": 33,
+      "maybe": 0,
+      "maybe_real": 0,
+      "accurate_1s": 69,
+      "accurate_2s": 100
+    }
+  },
+  "v1.1-2026-11": {
+    "version": "v1.1-2026-11",
+    "matches": {
+      "match1": {
+        "labeled": 5,
+        "shown": 4,
+        "missed": 1,
+        "fake": 0,
+        "confident_fake": 0,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 1,
+        "accurate_2s": 3
+      },
+      "match3": {
+        "labeled": 38,
+        "shown": 40,
+        "missed": 0,
+        "fake": 2,
+        "confident_fake": 0,
+        "maybe": 2,
+        "maybe_real": 0,
+        "accurate_1s": 30,
+        "accurate_2s": 30
+      },
+      "match4": {
+        "labeled": 26,
+        "shown": 26,
+        "missed": 0,
+        "fake": 0,
+        "confident_fake": 0,
+        "maybe": 1,
+        "maybe_real": 1,
+        "accurate_1s": 18,
+        "accurate_2s": 21
+      },
+      "match5": {
+        "labeled": 72,
+        "shown": 68,
+        "missed": 8,
+        "fake": 4,
+        "confident_fake": 4,
+        "maybe": 0,
+        "maybe_real": 0,
+        "accurate_1s": 48,
+        "accurate_2s": 51
+      }
+    },
+    "total": {
+      "labeled": 141,
+      "shown": 138,
+      "missed": 9,
+      "fake": 6,
+      "confident_fake": 4,
+      "maybe": 3,
+      "maybe_real": 1,
+      "accurate_1s": 97,
+      "accurate_2s": 105
+    }
+  }
+}

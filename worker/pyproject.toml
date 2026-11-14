@@ -12,6 +12,7 @@ dependencies = [
     "tqdm>=4.66",
     "parse>=1.20",
     "pillow>=11.0",
+    "scikit-learn==1.9.1",
 ]
 
 [tool.uv]

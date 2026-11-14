@@ -14,7 +14,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic import Field as PydanticField
-from sqlalchemy import Column, DateTime, Text
+from sqlalchemy import Column, DateTime, Index, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -176,6 +176,9 @@ class Video(SQLModel, table=True):
     court_corners: list[list[float]] | None = Field(
         default=None, sa_column=Column(JSONB(none_as_null=True))
     )
+    # Which detector made the current rallies ("v1", "v1.1-2026-11", ...); set by
+    # the worker with them. Null until the video has been processed.
+    detector_version: str | None = Field(default=None, max_length=30)
     # Worker bookkeeping (not in the API). claim_id is new on every claim; a worker
     # only writes to the video while claim_id is still its own, so a worker that was
     # wrongly declared dead can't overwrite the results of the one that took over.
@@ -215,6 +218,10 @@ class VideoPublic(SQLModel):
     width: int | None
     height: int | None
     court_corners: list[Point] | None
+    detector_version: str | None = Field(
+        description="Detector that made the rallies, e.g. 'v1' or 'v1.1-2026-11' "
+        "(null until processed). Re-analyzing uses the current detector."
+    )
     created_at: datetime
     updated_at: datetime
     # Filled in by crud (one aggregate query, also for whole lists)
@@ -254,6 +261,12 @@ class Rally(SQLModel, table=True):
     # version stays available as training labels.
     detected_start: float | None = None
     detected_end: float | None = None
+    # The detector's probability (0-1) that this is a real rally; null for v1 (rules)
+    # and for rallies the user added.
+    confidence: float | None = None
+    # Shown as a "maybe" the user confirms or deletes (detector was unsure). Cleared
+    # when the user confirms, edits, splits or merges it.
+    is_maybe: bool = Field(default=False, sa_column_kwargs={"server_default": "false"})
     created_at: datetime = Field(
         default_factory=get_datetime_utc,
         sa_type=DateTime(timezone=True),
@@ -269,6 +282,16 @@ class RallyPublic(SQLModel):
     )
     start: float
     end: float
+    confidence: float | None = Field(
+        default=None,
+        description="Detector's probability (0-1) that this is a real rally; null "
+        "for the v1 detector and for rallies the user added",
+    )
+    is_maybe: bool = Field(
+        default=False,
+        description="The detector was unsure: show it as a 'maybe' the user confirms "
+        "(POST /rallies/{id}/confirm) or deletes. Cleared by any edit.",
+    )
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -285,7 +308,7 @@ class RalliesPublic(SQLModel):
 
 MIN_RALLY_SECONDS = 0.1  # shortest rally (or part of a split) a user can make
 
-CorrectionAction = Literal["add", "edit", "delete", "split", "merge"]
+CorrectionAction = Literal["add", "edit", "delete", "split", "merge", "confirm"]
 
 
 class Correction(SQLModel, table=True):
@@ -374,6 +397,7 @@ class RallyChange(SQLModel):
 class ErrorCode(StrEnum):
     TRAJECTORY_MISSING = "trajectory_missing"  # analyzed before trails existed
     REEL_CHANGED = "reel_changed"  # stale save: the reel was saved elsewhere
+    REEL_MISSING = "reel_missing"  # the video has no reel yet
     THUMBNAILS_MISSING = "thumbnails_missing"  # analyzed before thumbnails existed
 
 
@@ -548,6 +572,18 @@ ReelTitle = Annotated[
 
 
 class Reel(SQLModel, table=True):
+    """One reel per video for the beta: at most one non-deleted reel per video_id
+    (a partial unique index; soft-deleted ones don't count)."""
+
+    __table_args__ = (
+        Index(
+            "uq_reel_video_id_live",
+            "video_id",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
+    )
+
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     video_id: uuid.UUID = Field(
         foreign_key="video.id", nullable=False, ondelete="CASCADE", index=True
@@ -573,6 +609,20 @@ class Reel(SQLModel, table=True):
 class ReelCreate(SQLModel):
     title: ReelTitle
     edit: ReelEdit = Field(default_factory=ReelEdit)
+
+
+class ReelSave(SQLModel):
+    """PUT /videos/{id}/reel: create the video's reel, or replace its title and edit
+    list."""
+
+    title: ReelTitle
+    edit: ReelEdit
+    updated_at: AwareDatetime | None = Field(
+        default=None,
+        description="null: create the reel (the video has none yet). Otherwise the "
+        "reel's updated_at as you loaded it. If the reel changed since (saved, "
+        "created or deleted elsewhere), nothing is saved: 409, code reel_changed",
+    )
 
 
 class ReelUpdate(SQLModel):

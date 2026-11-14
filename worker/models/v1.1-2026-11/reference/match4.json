@@ -1,0 +1,189 @@
+{
+  "csv": "prediction_fast_noinp/match4_720_ball.csv",
+  "court": "results/match4/court.json",
+  "fps": 30.0,
+  "rallies": [
+    {
+      "start": 3.63,
+      "end": 6.07,
+      "duration": 2.44,
+      "confidence": 0.9973,
+      "is_maybe": false
+    },
+    {
+      "start": 13.9,
+      "end": 15.73,
+      "duration": 1.83,
+      "confidence": 0.9475,
+      "is_maybe": false
+    },
+    {
+      "start": 24.37,
+      "end": 28.9,
+      "duration": 4.53,
+      "confidence": 0.9984,
+      "is_maybe": false
+    },
+    {
+      "start": 36.5,
+      "end": 39.23,
+      "duration": 2.73,
+      "confidence": 0.9902,
+      "is_maybe": false
+    },
+    {
+      "start": 46.7,
+      "end": 49.8,
+      "duration": 3.1,
+      "confidence": 0.9974,
+      "is_maybe": false
+    },
+    {
+      "start": 57.97,
+      "end": 63.8,
+      "duration": 5.83,
+      "confidence": 0.9975,
+      "is_maybe": false
+    },
+    {
+      "start": 73.37,
+      "end": 75.3,
+      "duration": 1.93,
+      "confidence": 0.997,
+      "is_maybe": false
+    },
+    {
+      "start": 83.7,
+      "end": 88.83,
+      "duration": 5.13,
+      "confidence": 0.9874,
+      "is_maybe": false
+    },
+    {
+      "start": 94.3,
+      "end": 101.07,
+      "duration": 6.77,
+      "confidence": 0.9968,
+      "is_maybe": false
+    },
+    {
+      "start": 106.7,
+      "end": 109.5,
+      "duration": 2.8,
+      "confidence": 0.9981,
+      "is_maybe": false
+    },
+    {
+      "start": 122.03,
+      "end": 125.3,
+      "duration": 3.27,
+      "confidence": 0.9989,
+      "is_maybe": false
+    },
+    {
+      "start": 136.5,
+      "end": 138.83,
+      "duration": 2.33,
+      "confidence": 0.9969,
+      "is_maybe": false
+    },
+    {
+      "start": 150.1,
+      "end": 161.9,
+      "duration": 11.8,
+      "confidence": 0.9989,
+      "is_maybe": false
+    },
+    {
+      "start": 170.47,
+      "end": 172.67,
+      "duration": 2.2,
+      "confidence": 0.9985,
+      "is_maybe": false
+    },
+    {
+      "start": 182.63,
+      "end": 185.63,
+      "duration": 3.0,
+      "confidence": 0.9895,
+      "is_maybe": false
+    },
+    {
+      "start": 194.7,
+      "end": 199.57,
+      "duration": 4.87,
+      "confidence": 0.9977,
+      "is_maybe": false
+    },
+    {
+      "start": 210.9,
+      "end": 219.7,
+      "duration": 8.8,
+      "confidence": 0.99,
+      "is_maybe": false
+    },
+    {
+      "start": 232.27,
+      "end": 234.3,
+      "duration": 2.03,
+      "confidence": 0.9977,
+      "is_maybe": false
+    },
+    {
+      "start": 244.67,
+      "end": 260.37,
+      "duration": 15.7,
+      "confidence": 0.9959,
+      "is_maybe": false
+    },
+    {
+      "start": 280.83,
+      "end": 284.0,
+      "duration": 3.17,
+      "confidence": 0.9987,
+      "is_maybe": false
+    },
+    {
+      "start": 306.4,
+      "end": 308.37,
+      "duration": 1.97,
+      "confidence": 0.9957,
+      "is_maybe": false
+    },
+    {
+      "start": 350.4,
+      "end": 358.97,
+      "duration": 8.57,
+      "confidence": 0.9927,
+      "is_maybe": false
+    },
+    {
+      "start": 364.5,
+      "end": 372.0,
+      "duration": 7.5,
+      "confidence": 0.9953,
+      "is_maybe": false
+    },
+    {
+      "start": 380.57,
+      "end": 383.93,
+      "duration": 3.36,
+      "confidence": 0.9986,
+      "is_maybe": false
+    },
+    {
+      "start": 392.9,
+      "end": 396.77,
+      "duration": 3.87,
+      "confidence": 0.999,
+      "is_maybe": false
+    },
+    {
+      "start": 407.97,
+      "end": 417.1,
+      "duration": 9.13,
+      "confidence": 0.999,
+      "is_maybe": false
+    }
+  ]
+}

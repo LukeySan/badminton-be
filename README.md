@@ -34,9 +34,13 @@ backend/             FastAPI API (the template's "app" package)
     alembic/versions/  database migrations
   tests/             pytest (incl. the worker loop, with a fake pipeline)
   scripts/           prestart (migrate + create admin), test, lint, format
-worker/              processing: downscale → TrackNet shuttle tracking → rally detection
+worker/              processing: 512x288 analysis copy → TrackNet shuttle tracking → rally detection
   run_worker.py        the job loop: claims queued videos, runs the pipeline
   pipeline.py          one video in, rallies out (also a CLI)
+  detector.py          detect_rallies(): v1 (rules) or v1.1 (rules + classifier + model boundaries)
+  rally_features.py    v1.1's feature code (copied from research; inference only)
+  models/<version>/    v1.1's trained models + meta.json (trained in research)
+  benchmark.py         regression check on the labeled matches (benchmark/: their tracking + labels)
   trajectory_file.py   writes the shuttle trajectory file the API serves
   thumbnail_strip.py   makes the thumbnail strip (sprite sheets + index.json)
   backfill_thumbnails.py  thumbnail strips for videos analyzed before they existed
@@ -125,11 +129,9 @@ own videos; the superuser sees all.
 | `GET /videos/{id}/thumbnails-url` | Signed links (12 h) to the thumbnail strip: `{index_url, sheet_urls, expires_at}`. 404 with `code: "thumbnails_missing"` before it exists |
 | `GET /videos/{id}/thumbnails/{name}?token=...` | `index.json` or a sheet (`sheet_000.jpg`) |
 | `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved. Still saved for every video; nothing in the app depends on it now |
-| `GET /videos/{id}/reels` | The video's reels, most recently saved first: `{data, count}` |
-| `POST /videos/{id}/reels` | Create a reel `{title, edit}` (see Reels below) |
-| `GET /reels/{id}` | One reel with its edit list |
-| `PUT /reels/{id}` | Save: replaces title and edit list. Send the `updated_at` you loaded; 409 with `code: "reel_changed"` if it was saved elsewhere since |
-| `DELETE /reels/{id}` | Soft delete (hidden, row kept) |
+| `GET /videos/{id}/reel` | The video's reel (one per video), or 404 with `code: "reel_missing"` if it has none yet |
+| `PUT /videos/{id}/reel` | Create or save it: `{title, edit, updated_at}`. `updated_at: null` creates it (201); the `updated_at` you loaded updates it (200, replaces title and edit list). Anything else (it now exists, changed or was deleted meanwhile): 409 with `code: "reel_changed"`, reload |
+| *deprecated* `GET /videos/{id}/reels`, `POST /videos/{id}/reels`, `GET`/`PUT`/`DELETE /reels/{id}` | The old several-reels-per-video API, kept until the frontend has switched. `POST` is now get-or-create: it returns the existing reel (200) instead of making a second one |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
 
@@ -146,6 +148,8 @@ something other than showing the message also carry a `code`
 
 **Reels** are non-destructive highlight edits: the original video is never changed; a
 reel is an edit list the app plays back. All times are seconds in the original video.
+For the beta a video has one reel (enforced by the database: a unique index on
+`video_id` over reels that aren't deleted).
 
 ```jsonc
 {
@@ -251,11 +255,21 @@ Postgres volume is first made), so they never touch your development data. Uploa
 videos go to a temporary folder. GitHub Actions runs lint + tests on every push to `main`
 and on pull requests, and fails below 90% coverage.
 
-The worker's own failure checks (unreadable video, court not visible) need OpenCV, which
-CI doesn't install; run them locally from the repo root:
+The worker's own tests (failure checks, the analysis copy, the v1.1 detector against
+research's reference output) need OpenCV and scikit-learn, which CI doesn't install;
+run them locally from the repo root:
 
 ```bash
 uv run pytest worker/tests -q
+```
+
+Before and after changing anything in rally detection, run the benchmark on the 4
+labeled matches (stored tracking, no GPU needed; prints missed / fake / maybes /
+accurate per detector, with the difference from the saved baseline):
+
+```bash
+uv run --package worker python worker/benchmark.py
+uv run --package worker python worker/benchmark.py --save-baseline   # after an intended change
 ```
 
 ## Database changes (migrations)
@@ -279,6 +293,9 @@ uv run --package worker python worker/run_worker.py --batch-size 16  # on an NVI
 
 It checks the queue every 5 s (`--poll`), takes the oldest queued video, and sets it to
 `processing` → `done` (rallies saved) or `failed` (with the error in `error`).
+The rally detector comes from `DETECTOR_VERSION` in `.env` (`v1.1` by default, `v1` for
+the old rules); each video records the version that made its rallies, and
+re-analyzing a video (`POST /videos/{id}/process`) uses the current one.
 Reprocessing a video replaces its old rallies, in the same transaction that marks it
 done, so the app never sees half-saved results. A failed reprocess keeps the old ones.
 

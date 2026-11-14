@@ -7,6 +7,7 @@ from sqlmodel import Session, col, select, update
 
 from app import crud
 from app.core.config import settings
+from app.crud import DetectedRally
 from app.models import Rally, Reel, ReelEdit, Video
 
 
@@ -59,18 +60,19 @@ def test_reanalysis_moves_reel_clips_to_the_new_rallies(
             ]
         }
     )
-    reel = crud.create_reel(session=db, video=video, title="r", edit=edit)
     deleted = crud.create_reel(session=db, video=video, title="d", edit=edit)
+    assert deleted
     crud.soft_delete_reel(session=db, reel_id=deleted.id)
-    empty = crud.create_reel(session=db, video=video, title="e", edit=ReelEdit())
-    saved_at = {r.id: r.updated_at for r in (reel, deleted, empty)}
+    reel = crud.create_reel(session=db, video=video, title="r", edit=edit)
+    assert reel
+    saved_at = reel.updated_at
 
     with Session(engine) as session:
         assert crud.finish_video(
             session=session,
             video_id=video.id,
             claim_id=claim_id,
-            rallies=[(10.5, 19.0), (31.0, 44.0)],
+            rallies=[DetectedRally(10.5, 19.0), DetectedRally(31.0, 44.0)],
         )
 
     new = {
@@ -95,11 +97,11 @@ def test_reanalysis_moves_reel_clips_to_the_new_rallies(
             }
         ).clips
     )
-    # Moved reels count as changed (an open editor must reload); others don't
-    assert moved.updated_at > saved_at[reel.id]
-    still_deleted, untouched = db.get(Reel, deleted.id), db.get(Reel, empty.id)
+    # Moved reels count as changed (an open editor must reload)
+    assert moved.updated_at > saved_at
+    # Deleted reels are left as they were
+    still_deleted = db.get(Reel, deleted.id)
     assert still_deleted and still_deleted.edit["clips"][0]["rally_id"] == old_ids[1]
-    assert untouched and untouched.updated_at == saved_at[empty.id]
     # ...and the moved reel passes validation again
     assert not ReelEdit.model_validate(moved.edit).problems(
         duration=120.0,
@@ -107,11 +109,31 @@ def test_reanalysis_moves_reel_clips_to_the_new_rallies(
     )
 
 
+def test_reanalysis_leaves_an_unaffected_reel_alone(
+    db: Session, engine: Engine
+) -> None:
+    video, claim_id, _ = make_processing_video(db, [(10.0, 20.0)])
+    reel = crud.create_reel(session=db, video=video, title="e", edit=ReelEdit())
+    assert reel
+    saved_at = reel.updated_at
+    with Session(engine) as session:
+        crud.finish_video(
+            session=session,
+            video_id=video.id,
+            claim_id=claim_id,
+            rallies=[DetectedRally(11, 19)],
+        )
+    db.expire_all()
+    untouched = db.get(Reel, reel.id)
+    assert untouched and untouched.updated_at == saved_at
+
+
 def test_simultaneous_saves_only_one_wins(db: Session, engine: Engine) -> None:
     """Six saves from the same loaded version at once: the conditional UPDATE lets
     exactly one through, the rest get "changed since" (409 in the API)."""
     video, _, _ = make_processing_video(db, [])
     reel = crud.create_reel(session=db, video=video, title="r", edit=ReelEdit())
+    assert reel
     loaded_at: datetime = reel.updated_at
     results: list[bool] = []
     barrier = threading.Barrier(6)
@@ -170,3 +192,32 @@ def test_simultaneous_corrections_are_serialized(db: Session, engine: Engine) ->
     assert sorted(results) == ["409", "409", "409", "added"]
     rallies = db.exec(select(Rally).where(col(Rally.video_id) == video.id)).all()
     assert len(rallies) == 2
+
+
+def test_simultaneous_creates_make_one_reel(db: Session, engine: Engine) -> None:
+    """Six "create the reel" saves at once (updated_at null): one creates it, the
+    others are refused (409 in the API), and no request errors."""
+    video_id = make_processing_video(db, [])[0].id
+    results: list[bool] = []
+    barrier = threading.Barrier(6)
+
+    def create() -> None:
+        with Session(engine) as session:
+            video = session.get(Video, video_id)  # each thread its own session's copy
+            assert video
+            barrier.wait()
+            reel, created = crud.save_video_reel(
+                session=session,
+                video=video,
+                title="r",
+                edit=ReelEdit(),
+                expected_updated_at=None,
+            )
+            results.append(reel is not None and created)
+
+    threads = [threading.Thread(target=create) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(results) == [False] * 5 + [True]

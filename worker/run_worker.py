@@ -24,7 +24,7 @@ import uuid
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
@@ -49,10 +49,19 @@ TRACKING_LOG_STEP = 10  # log tracking progress every 10%
 
 logger = logging.getLogger("worker")
 
-# (video file, corner fractions, work dir, on_progress(0-1), log(line)) -> rallies
+
+class Detection(TypedDict):
+    """What the pipeline returns (detector.detect_rallies): the detector's version
+    and its rallies, [{start, end, duration, confidence, is_maybe}] in seconds."""
+
+    detector_version: str
+    rallies: list[dict[str, Any]]
+
+
+# (video file, corner fractions, work dir, on_progress(0-1), log(line)) -> Detection
 Processor = Callable[
     [Path, list[list[float]], Path, Callable[[float], None], Callable[[str], None]],
-    list[dict[str, Any]],
+    Detection,
 ]
 
 # Pipeline errors -> what the user sees. Any other exception is a bug: UNKNOWN.
@@ -115,20 +124,22 @@ def run_pipeline(
     on_progress: Callable[[float], None],
     log: Callable[[str], None],
     batch_size: int = 4,
-) -> list[dict[str, Any]]:
+    detector: str = settings.DETECTOR_VERSION,
+) -> Detection:
     # Imported here so torch/opencv only load when there's actually a job,
     # and so tests can run the loop with a fake processor without them.
     from pipeline import process_video
 
-    rallies: list[dict[str, Any]] = process_video(
+    result: Detection = process_video(
         str(video_path),
         corners,
         str(work_dir),
         batch_size=batch_size,
         on_progress=on_progress,
         log=log,
+        detector=detector,
     )
-    return rallies
+    return result
 
 
 class Heartbeat(threading.Thread):
@@ -234,7 +245,7 @@ def process_one(
     try:
         if corners is None:
             raise ValueError("The video has no court corners")
-        rallies = processor(
+        result = processor(
             video_path, corners, work_dir, heartbeat.on_progress, log.info
         )
     except JobLost:
@@ -267,18 +278,32 @@ def process_one(
     heartbeat.stop()
 
     publish_outputs(work_dir, video_id)
+    rallies, version = result["rallies"], result["detector_version"]
     with Session(engine) as session:
         saved = crud.finish_video(
             session=session,
             video_id=video_id,
             claim_id=claim_id,
-            rallies=[(float(r["start"]), float(r["end"])) for r in rallies],
+            rallies=[
+                crud.DetectedRally(
+                    float(r["start"]),
+                    float(r["end"]),
+                    r.get("confidence"),
+                    bool(r.get("is_maybe", False)),
+                )
+                for r in rallies
+            ],
+            detector_version=version,
+            source="rules" if version == "v1" else "model",
         )
     if saved:
         play = sum(float(r["end"]) - float(r["start"]) for r in rallies)
+        maybes = sum(1 for r in rallies if r.get("is_maybe"))
         log.info(
-            f"done: {len(rallies)} rallies ({play / 60:.1f} min of play) "
-            f"in {fmt_duration(time.monotonic() - started)}"
+            f"done: {len(rallies)} rallies"
+            + (f", {maybes} maybe" if maybes else "")
+            + f" ({play / 60:.1f} min of play) "
+            f"in {fmt_duration(time.monotonic() - started)}, detector {version}"
         )
     else:
         log.warning("lost: results discarded, another worker has this job now")
@@ -308,6 +333,12 @@ def main() -> None:
     )
 
     worker_name = f"{socket.gethostname()}:{os.getpid()}"
+    detector = settings.DETECTOR_VERSION
+    # Load the detector's model now: a missing or mismatched model file should stop
+    # the worker at start, not fail every video it claims.
+    from detector import DETECTORS, preload
+
+    preload(detector)
 
     def processor(
         video_path: Path,
@@ -315,12 +346,22 @@ def main() -> None:
         work_dir: Path,
         on_progress: Callable[[float], None],
         log: Callable[[str], None],
-    ) -> list[dict[str, Any]]:
+    ) -> Detection:
         return run_pipeline(
-            video_path, corners, work_dir, on_progress, log, batch_size=args.batch_size
+            video_path,
+            corners,
+            work_dir,
+            on_progress,
+            log,
+            batch_size=args.batch_size,
+            detector=detector,
         )
 
-    logger.info("Worker %s started, waiting for jobs", worker_name)
+    logger.info(
+        "Worker %s started (detector %s), waiting for jobs",
+        worker_name,
+        DETECTORS[detector],
+    )
     try:
         while True:
             try:

@@ -62,6 +62,7 @@ def test_set_analysis_finishes_video_like_a_worker(
     assert data["status"] == "done"
     assert data["rally_count"] == 2
     assert data["play_seconds"] == 2.5
+    assert data["detector_version"] == "test-fixture"
 
     rallies = client.get(
         f"{settings.API_V1_STR}/videos/{video.id}/rallies",
@@ -78,6 +79,42 @@ def test_set_analysis_finishes_video_like_a_worker(
         (False, None),
         (True, 0.5),
         (True, 0.6),
+    ]
+
+
+def test_set_analysis_with_maybe_rallies_and_a_detector_version(
+    client: TestClient, superuser_token_headers: dict[str, str], db: Session
+) -> None:
+    owner = crud.get_user_by_email(session=db, email=settings.FIRST_SUPERUSER)
+    assert owner
+    video = Video(
+        owner_id=owner.id,
+        filename="seeded.mp4",
+        storage_path="x/original.mp4",
+        status="uploaded",
+        duration=30.0,
+    )
+    db.add(video)
+    db.commit()
+    r = client.post(
+        f"{settings.API_V1_STR}/private/videos/{video.id}/analysis",
+        json={
+            "rallies": [
+                [2.0, 3.5],
+                {"start": 8.0, "end": 12.0, "confidence": 0.55, "is_maybe": True},
+            ],
+            "detector_version": "v1.1-2026-11",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["detector_version"] == "v1.1-2026-11"
+    rallies = client.get(
+        f"{settings.API_V1_STR}/videos/{video.id}/rallies",
+        headers=superuser_token_headers,
+    ).json()["data"]
+    assert [(x["start"], x["is_maybe"], x["confidence"]) for x in rallies] == [
+        (2.0, False, None),
+        (8.0, True, 0.55),
     ]
 
 

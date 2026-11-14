@@ -1,0 +1,266 @@
+{
+  "csv": "results/match3/tracknet_fast.csv",
+  "court": "results/match3/court.json",
+  "fps": 30.0,
+  "rallies": [
+    {
+      "start": 0.6,
+      "end": 6.8,
+      "duration": 6.2,
+      "confidence": 0.9987,
+      "is_maybe": false
+    },
+    {
+      "start": 21.0,
+      "end": 25.27,
+      "duration": 4.27,
+      "confidence": 0.9984,
+      "is_maybe": false
+    },
+    {
+      "start": 35.2,
+      "end": 37.57,
+      "duration": 2.37,
+      "confidence": 0.9985,
+      "is_maybe": false
+    },
+    {
+      "start": 48.07,
+      "end": 55.7,
+      "duration": 7.63,
+      "confidence": 0.9636,
+      "is_maybe": false
+    },
+    {
+      "start": 60.4,
+      "end": 65.57,
+      "duration": 5.17,
+      "confidence": 0.9822,
+      "is_maybe": false
+    },
+    {
+      "start": 80.47,
+      "end": 83.2,
+      "duration": 2.73,
+      "confidence": 0.9987,
+      "is_maybe": false
+    },
+    {
+      "start": 97.3,
+      "end": 98.53,
+      "duration": 1.23,
+      "confidence": 0.9953,
+      "is_maybe": false
+    },
+    {
+      "start": 111.57,
+      "end": 118.77,
+      "duration": 7.2,
+      "confidence": 0.996,
+      "is_maybe": false
+    },
+    {
+      "start": 126.1,
+      "end": 127.2,
+      "duration": 1.1,
+      "confidence": 0.9928,
+      "is_maybe": false
+    },
+    {
+      "start": 145.6,
+      "end": 152.03,
+      "duration": 6.43,
+      "confidence": 0.9969,
+      "is_maybe": false
+    },
+    {
+      "start": 162.07,
+      "end": 175.73,
+      "duration": 13.66,
+      "confidence": 0.9975,
+      "is_maybe": false
+    },
+    {
+      "start": 194.3,
+      "end": 196.9,
+      "duration": 2.6,
+      "confidence": 0.9984,
+      "is_maybe": false
+    },
+    {
+      "start": 213.2,
+      "end": 215.7,
+      "duration": 2.5,
+      "confidence": 0.9961,
+      "is_maybe": false
+    },
+    {
+      "start": 233.03,
+      "end": 237.4,
+      "duration": 4.37,
+      "confidence": 0.9881,
+      "is_maybe": false
+    },
+    {
+      "start": 244.43,
+      "end": 245.8,
+      "duration": 1.37,
+      "confidence": 0.9915,
+      "is_maybe": false
+    },
+    {
+      "start": 255.27,
+      "end": 258.37,
+      "duration": 3.1,
+      "confidence": 0.9987,
+      "is_maybe": false
+    },
+    {
+      "start": 319.3,
+      "end": 321.37,
+      "duration": 2.07,
+      "confidence": 0.9979,
+      "is_maybe": false
+    },
+    {
+      "start": 327.87,
+      "end": 332.3,
+      "duration": 4.43,
+      "confidence": 0.9575,
+      "is_maybe": false
+    },
+    {
+      "start": 338.13,
+      "end": 343.73,
+      "duration": 5.6,
+      "confidence": 0.9946,
+      "is_maybe": false
+    },
+    {
+      "start": 347.6,
+      "end": 355.1,
+      "duration": 7.5,
+      "confidence": 0.9935,
+      "is_maybe": false
+    },
+    {
+      "start": 360.67,
+      "end": 363.73,
+      "duration": 3.06,
+      "confidence": 0.9943,
+      "is_maybe": false
+    },
+    {
+      "start": 379.13,
+      "end": 384.73,
+      "duration": 5.6,
+      "confidence": 0.9455,
+      "is_maybe": false
+    },
+    {
+      "start": 392.6,
+      "end": 396.57,
+      "duration": 3.97,
+      "confidence": 0.9962,
+      "is_maybe": false
+    },
+    {
+      "start": 411.0,
+      "end": 412.5,
+      "duration": 1.5,
+      "confidence": 0.9968,
+      "is_maybe": false
+    },
+    {
+      "start": 429.8,
+      "end": 436.3,
+      "duration": 6.5,
+      "confidence": 0.9986,
+      "is_maybe": false
+    },
+    {
+      "start": 456.7,
+      "end": 459.23,
+      "duration": 2.53,
+      "confidence": 0.998,
+      "is_maybe": false
+    },
+    {
+      "start": 470.27,
+      "end": 476.9,
+      "duration": 6.63,
+      "confidence": 0.9981,
+      "is_maybe": false
+    },
+    {
+      "start": 491.53,
+      "end": 495.13,
+      "duration": 3.6,
+      "confidence": 0.9977,
+      "is_maybe": false
+    },
+    {
+      "start": 508.23,
+      "end": 513.13,
+      "duration": 4.9,
+      "confidence": 0.9793,
+      "is_maybe": false
+    },
+    {
+      "start": 526.07,
+      "end": 530.37,
+      "duration": 4.3,
+      "confidence": 0.999,
+      "is_maybe": false
+    },
+    {
+      "start": 545.73,
+      "end": 551.3,
+      "duration": 5.57,
+      "confidence": 0.9981,
+      "is_maybe": false
+    },
+    {
+      "start": 562.57,
+      "end": 567.1,
+      "duration": 4.53,
+      "confidence": 0.9983,
+      "is_maybe": false
+    },
+    {
+      "start": 583.57,
+      "end": 588.4,
+      "duration": 4.83,
+      "confidence": 0.9912,
+      "is_maybe": false
+    },
+    {
+      "start": 598.73,
+      "end": 604.3,
+      "duration": 5.57,
+      "confidence": 0.9989,
+      "is_maybe": false
+    },
+    {
+      "start": 624.23,
+      "end": 627.0,
+      "duration": 2.77,
+      "confidence": 0.9959,
+      "is_maybe": false
+    },
+    {
+      "start": 636.87,
+      "end": 643.8,
+      "duration": 6.93,
+      "confidence": 0.9985,
+      "is_maybe": false
+    },
+    {
+      "start": 659.63,
+      "end": 662.77,
+      "duration": 3.14,
+      "confidence": 0.9971,
+      "is_maybe": false
+    }
+  ]
+}
