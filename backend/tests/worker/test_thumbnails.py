@@ -136,14 +136,14 @@ def test_unreadable_video_leaves_nothing(tmp_path: Path) -> None:
 def processor_writing_strip(fail: bool = False) -> run_worker.Processor:
     def processor(
         _path: Path, _corners: Any, work_dir: Path, _progress: Any, _log: Any
-    ) -> list[dict[str, Any]]:
+    ) -> run_worker.Detection:
         strip = work_dir / "thumbnails"
         strip.mkdir(parents=True, exist_ok=True)
         (strip / "index.json").write_text('{"sheets": ["sheet_000.jpg"]}')
         (strip / "sheet_000.jpg").write_bytes(b"new")
         if fail:
             raise CourtNotVisible("shuttle inside the court zone in 0.0% of frames")
-        return []
+        return {"detector_version": "v1.1-2026-11", "rallies": []}
 
     return processor
 
@@ -222,6 +222,21 @@ def test_backfill_prefers_the_analysis_copy_and_can_force(
     assert outcome["made"] == [video_id]
     index = thumbnails.read_index(video_id)
     assert index and index["count"] == 1  # made from the 1 s analysis copy
+
+
+def test_backfill_prefers_the_current_analysis_copy_name(
+    db: Session, engine: Engine, clip: Path
+) -> None:
+    """Newer runs name the analysis copy analysis.mp4; older work folders may still
+    have video_720.mp4 too."""
+    video_id = stored_video(db, clip)
+    work = settings.STORAGE_DIR / str(video_id) / "work"
+    work.mkdir()
+    make_clip(work / "video_720.mp4", 1.0)
+    make_clip(work / "analysis.mp4", 2.0)
+    backfill_thumbnails.backfill(engine, video_ids=[video_id], force=True)
+    index = thumbnails.read_index(video_id)
+    assert index and index["count"] == 2  # from analysis.mp4
 
 
 def test_backfill_command_exit_code(

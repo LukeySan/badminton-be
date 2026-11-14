@@ -12,6 +12,8 @@ storage/
 *.MOV
 *.pt
 *.joblib
+# ...except the rally detector's models, which ship with the code (~1.4 MB per version)
+!worker/models/**/*.joblib
 worker/ckpts/*
 !worker/ckpts/README.md
 worker/output/

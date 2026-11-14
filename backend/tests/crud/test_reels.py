@@ -7,6 +7,7 @@ from sqlmodel import Session, col, select, update
 
 from app import crud
 from app.core.config import settings
+from app.crud import DetectedRally
 from app.models import Rally, Reel, ReelEdit, Video
 
 
@@ -71,7 +72,7 @@ def test_reanalysis_moves_reel_clips_to_the_new_rallies(
             session=session,
             video_id=video.id,
             claim_id=claim_id,
-            rallies=[(10.5, 19.0), (31.0, 44.0)],
+            rallies=[DetectedRally(10.5, 19.0), DetectedRally(31.0, 44.0)],
         )
 
     new = {
@@ -117,7 +118,10 @@ def test_reanalysis_leaves_an_unaffected_reel_alone(
     saved_at = reel.updated_at
     with Session(engine) as session:
         crud.finish_video(
-            session=session, video_id=video.id, claim_id=claim_id, rallies=[(11, 19)]
+            session=session,
+            video_id=video.id,
+            claim_id=claim_id,
+            rallies=[DetectedRally(11, 19)],
         )
     db.expire_all()
     untouched = db.get(Reel, reel.id)

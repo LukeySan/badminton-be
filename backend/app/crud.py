@@ -1,7 +1,7 @@
 import uuid
 from collections.abc import Sequence
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from sqlalchemy import extract, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -311,20 +311,37 @@ def heartbeat_video(
     return result.rowcount == 1
 
 
+class DetectedRally(NamedTuple):
+    """One rally as the worker's detector returns it (seconds)."""
+
+    start: float
+    end: float
+    confidence: float | None = None
+    is_maybe: bool = False
+
+
 def finish_video(
     *,
     session: Session,
     video_id: uuid.UUID,
     claim_id: uuid.UUID,
-    rallies: Sequence[tuple[float, float]],
+    rallies: Sequence[DetectedRally],
+    detector_version: str | None = None,
     source: str = "rules",
 ) -> bool:
     """Replace the video's rallies and mark it done, in one transaction, so the app
-    never sees "done" with old or half-written rallies. False = no longer ours."""
+    never sees "done" with old or half-written rallies. False = no longer ours.
+    detector_version is recorded on the video (which detector made these rallies)."""
     result = session.exec(
         update(Video)
         .where(*_claimed(video_id, claim_id))
-        .values(status="done", progress=1.0, claim_id=None, updated_at=func.now())
+        .values(
+            status="done",
+            progress=1.0,
+            claim_id=None,
+            detector_version=detector_version,
+            updated_at=func.now(),
+        )
     )
     if result.rowcount != 1:
         session.rollback()
@@ -332,9 +349,10 @@ def finish_video(
     session.exec(delete(Rally).where(col(Rally.video_id) == video_id))
     # The detector's bounds are kept separately, for when the user corrects them
     new_rallies = [
-        Rally(video_id=video_id, start=start, end=end, source=source,
-              detected_start=start, detected_end=end)
-        for start, end in rallies
+        Rally(video_id=video_id, start=r.start, end=r.end, source=source,
+              detected_start=r.start, detected_end=r.end,
+              confidence=r.confidence, is_maybe=r.is_maybe)
+        for r in rallies
     ]  # fmt: skip
     session.add_all(new_rallies)
     session.flush()  # assigns the new rally ids
@@ -643,7 +661,14 @@ def numbered_rallies(*, session: Session, video_id: uuid.UUID) -> list[RallyPubl
         .order_by(col(Rally.start), col(Rally.id))
     ).all()
     return [
-        RallyPublic(id=r.id, number=n, start=r.start, end=r.end)
+        RallyPublic(
+            id=r.id,
+            number=n,
+            start=r.start,
+            end=r.end,
+            confidence=r.confidence,
+            is_maybe=r.is_maybe,
+        )
         for n, r in enumerate(rallies, 1)
         if r.id is not None
     ]
@@ -786,6 +811,7 @@ def edit_rally(
     if (rally.start, rally.end) == (start, end):
         return c.finish()
     rally.start, rally.end = start, end
+    rally.is_maybe = False  # the user reshaped it, so it's a rally to them
     session.add(rally)
     c.log("edit", rally, rally, _detected(rally))
     target = Target(rally_id, start, end)
@@ -793,6 +819,21 @@ def edit_rally(
         updated=[rally],
         retarget=lambda clip: [target] if clip.rally_id == rally_id else None,
     )
+
+
+def confirm_rally(
+    *, session: Session, video_id: uuid.UUID, user_id: uuid.UUID, rally_id: int
+) -> RallyChange:
+    """The user's answer "yes, that's a rally" to a "maybe". Logged like the other
+    corrections: every answer is a training label for the detector."""
+    c = _Correction(session, video_id, user_id)
+    rally = c.get(rally_id)
+    if not rally.is_maybe:
+        return c.finish()
+    rally.is_maybe = False
+    session.add(rally)
+    c.log("confirm", rally, rally, _detected(rally))
+    return c.finish(updated=[rally])
 
 
 def delete_rally(
@@ -832,8 +873,10 @@ def split_rally(
         source=rally.source,
         detected_start=rally.detected_start,
         detected_end=rally.detected_end,
+        confidence=rally.confidence,
     )
     rally.end = at
+    rally.is_maybe = False
     session.add_all([rally, second])
     session.flush()
     assert second.id is not None
@@ -875,6 +918,8 @@ def merge_rallies(
         else second.detected_start,
         detected_end=second.detected_end if second.detected_end is not None
         else first.detected_end,
+        confidence=max((r.confidence for r in (first, second)
+                        if r.confidence is not None), default=None),
     )  # fmt: skip
     session.add(merged)
     session.flush()

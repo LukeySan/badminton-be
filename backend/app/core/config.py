@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     MAX_VIDEO_MINUTES: float = 60
     MAX_ACTIVE_VIDEOS_PER_USER: int = 2  # queued or processing at the same time
 
+    # Rally detector the worker uses for new and re-analyzed videos (worker/detector.py).
+    # "v1" = the old rules, kept for comparison and rollback.
+    DETECTOR_VERSION: Literal["v1", "v1.1"] = "v1.1"
+
     @field_validator("DATABASE_URL", "TEST_DATABASE_URL", mode="before")
     @classmethod
     def _use_psycopg_driver(cls, value: str | PostgresDsn | None) -> str | None:

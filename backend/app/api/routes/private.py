@@ -57,8 +57,18 @@ class PrivateTrajectory(BaseModel):
     y: list[float | None]
 
 
+class PrivateRally(BaseModel):
+    start: float
+    end: float
+    confidence: float | None = None
+    is_maybe: bool = False
+
+
 class PrivateAnalysis(BaseModel):
-    rallies: list[tuple[float, float]]
+    rallies: list[tuple[float, float] | PrivateRally] = Field(
+        description="[start, end] pairs, or objects with confidence / is_maybe"
+    )
+    detector_version: str | None = "test-fixture"
     trajectory: PrivateTrajectory | None = None
     thumbnails: bool = Field(
         default=False,
@@ -105,8 +115,18 @@ def set_analysis(id: uuid.UUID, body: PrivateAnalysis, session: SessionDep) -> A
         os.replace(tmp, path)
     if body.thumbnails:
         _make_thumbnails(video)
+    rallies = [
+        crud.DetectedRally(r.start, r.end, r.confidence, r.is_maybe)
+        if isinstance(r, PrivateRally)
+        else crud.DetectedRally(*r)
+        for r in body.rallies
+    ]
     crud.finish_video(
-        session=session, video_id=id, claim_id=claim_id, rallies=body.rallies
+        session=session,
+        video_id=id,
+        claim_id=claim_id,
+        rallies=rallies,
+        detector_version=body.detector_version,
     )
     session.refresh(video)
     return crud.get_video_public(session=session, video=video)

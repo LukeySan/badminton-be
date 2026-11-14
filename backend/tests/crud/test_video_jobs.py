@@ -9,6 +9,7 @@ from sqlmodel import Session, col, delete, func, select, update
 
 from app import crud
 from app.core.config import settings
+from app.crud import DetectedRally
 from app.models import FailureReason, Rally, Video
 
 COURT = [[0.478, 0.347], [0.777, 0.369], [0.93, 0.943], [0.054, 0.781]]
@@ -214,7 +215,7 @@ def test_finish_replaces_old_rallies(db: Session, engine: Engine) -> None:
             session=session,
             video_id=video_id,
             claim_id=video.claim_id,
-            rallies=[(10.5, 20.0), (3.0, 7.25)],
+            rallies=[DetectedRally(10.5, 20.0), DetectedRally(3.0, 7.25)],
         )
 
     done = fetch(engine, video_id)
@@ -291,7 +292,7 @@ def test_old_claim_cannot_write_after_job_was_taken_over(
     with Session(engine) as session:
         kw = {"session": session, "video_id": video_id, "claim_id": a.claim_id}
         assert not crud.heartbeat_video(**kw, progress=0.9)
-        assert not crud.finish_video(**kw, rallies=[(1.0, 2.0)])
+        assert not crud.finish_video(**kw, rallies=[DetectedRally(1.0, 2.0)])
         assert not crud.fail_video(**kw, reason=FailureReason.UNKNOWN, error="late")
         assert not crud.release_video(**kw)
 
@@ -316,7 +317,7 @@ def test_writes_for_a_deleted_video_are_ignored(db: Session, engine: Engine) -> 
             session=session,
             video_id=video_id,
             claim_id=video.claim_id,
-            rallies=[(1, 2)],
+            rallies=[DetectedRally(1, 2)],
         )
     assert rallies_of(engine, video_id) == []
 

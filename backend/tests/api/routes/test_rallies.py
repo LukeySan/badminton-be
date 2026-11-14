@@ -452,6 +452,7 @@ def test_no_corrections_while_queued_or_processing(
         client.put(url(video[0], f"/{a}"), headers=h, json={"start": 11, "end": 19}),
         client.delete(url(video[0], f"/{a}"), headers=h),
         client.post(url(video[0], f"/{a}/split"), headers=h, json={"at": 15}),
+        client.post(url(video[0], f"/{a}/confirm"), headers=h),
     ]:
         assert r.status_code == 409
         assert r.json()["detail"] == f"Can't change rallies while the video is {status}"
@@ -520,3 +521,113 @@ def test_missing_video(
         json={"start": 1, "end": 2},
     )
     assert r.status_code == 404
+
+
+# --- "maybe" rallies (detector v1.1) ---------------------------------------------
+
+
+def make_maybe(db: Session, rally_id: int, confidence: float = 0.5) -> None:
+    db.exec(
+        update(Rally)
+        .where(col(Rally.id) == rally_id)
+        .values(is_maybe=True, confidence=confidence)
+    )
+    db.commit()
+
+
+def maybe_flags(change: dict[str, Any]) -> list[tuple[float, bool, float | None]]:
+    return [(r["start"], r["is_maybe"], r["confidence"]) for r in change["rallies"]]
+
+
+def test_rallies_show_confidence_and_maybe(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    make_maybe(db, video[1][1], confidence=0.42)
+    r = client.get(url(video[0]), headers=normal_user_token_headers)
+    assert [(d["is_maybe"], d["confidence"]) for d in r.json()["data"]] == [
+        (False, None),
+        (True, 0.42),
+        (False, None),
+    ]
+
+
+def test_confirm_a_maybe(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    b = video[1][1]
+    make_maybe(db, b)
+    r = client.post(url(video[0], f"/{b}/confirm"), headers=normal_user_token_headers)
+    assert r.status_code == 200
+    change = r.json()
+    assert [u["id"] for u in change["updated"]] == [b]
+    assert change["updated"][0]["is_maybe"] is False
+    assert maybe_flags(change)[1] == (30.0, False, 0.5)  # confidence kept
+    [c] = corrections(db, video[0])
+    assert (c.action, c.rally_id, c.result_rally_id) == ("confirm", b, b)
+    assert (c.original_start, c.original_end, c.edited_start, c.edited_end) == (
+        30.0,
+        45.0,
+        30.0,
+        45.0,
+    )
+
+
+def test_confirm_a_rally_that_isnt_a_maybe_changes_nothing(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    r = client.post(
+        url(video[0], f"/{video[1][0]}/confirm"), headers=normal_user_token_headers
+    )
+    assert r.status_code == 200
+    assert r.json()["updated"] == []
+    assert corrections(db, video[0]) == []
+    missing = client.post(
+        url(video[0], "/999999/confirm"), headers=normal_user_token_headers
+    )
+    assert missing.status_code == 404
+
+
+def test_edit_split_and_merge_clear_maybe(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    """Any correction means the user decided it's a rally."""
+    h = normal_user_token_headers
+    a, b, c = video[1]
+    for rally_id, confidence in ((a, 0.3), (b, 0.6), (c, 0.7)):
+        make_maybe(db, rally_id, confidence)
+
+    r = client.put(url(video[0], f"/{a}"), headers=h, json={"start": 11, "end": 19})
+    assert maybe_flags(r.json())[0] == (11.0, False, 0.3)
+
+    r = client.post(url(video[0], f"/{b}/split"), headers=h, json={"at": 38})
+    assert maybe_flags(r.json())[1:3] == [(30.0, False, 0.6), (38.0, False, 0.6)]
+
+    rallies = r.json()["rallies"]
+    pair = [rallies[2]["id"], rallies[3]["id"]]  # second half of b, then c
+    make_maybe(db, pair[0], 0.6)
+    r = client.post(url(video[0], "/merge"), headers=h, json={"rally_ids": pair})
+    assert maybe_flags(r.json())[2] == (38.0, False, 0.7)  # the more confident one
+
+
+def test_added_rallies_are_never_maybe(
+    client: TestClient,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    r = client.post(
+        url(video[0]), headers=normal_user_token_headers, json={"start": 21, "end": 25}
+    )
+    added = r.json()["added"][0]
+    assert (added["is_maybe"], added["confidence"]) == (False, None)

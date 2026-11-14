@@ -34,9 +34,13 @@ backend/             FastAPI API (the template's "app" package)
     alembic/versions/  database migrations
   tests/             pytest (incl. the worker loop, with a fake pipeline)
   scripts/           prestart (migrate + create admin), test, lint, format
-worker/              processing: downscale → TrackNet shuttle tracking → rally detection
+worker/              processing: 512x288 analysis copy → TrackNet shuttle tracking → rally detection
   run_worker.py        the job loop: claims queued videos, runs the pipeline
   pipeline.py          one video in, rallies out (also a CLI)
+  detector.py          detect_rallies(): v1 (rules) or v1.1 (rules + classifier + model boundaries)
+  rally_features.py    v1.1's feature code (copied from research; inference only)
+  models/<version>/    v1.1's trained models + meta.json (trained in research)
+  benchmark.py         regression check on the labeled matches (benchmark/: their tracking + labels)
   trajectory_file.py   writes the shuttle trajectory file the API serves
   thumbnail_strip.py   makes the thumbnail strip (sprite sheets + index.json)
   backfill_thumbnails.py  thumbnail strips for videos analyzed before they existed
@@ -251,11 +255,21 @@ Postgres volume is first made), so they never touch your development data. Uploa
 videos go to a temporary folder. GitHub Actions runs lint + tests on every push to `main`
 and on pull requests, and fails below 90% coverage.
 
-The worker's own failure checks (unreadable video, court not visible) need OpenCV, which
-CI doesn't install; run them locally from the repo root:
+The worker's own tests (failure checks, the analysis copy, the v1.1 detector against
+research's reference output) need OpenCV and scikit-learn, which CI doesn't install;
+run them locally from the repo root:
 
 ```bash
 uv run pytest worker/tests -q
+```
+
+Before and after changing anything in rally detection, run the benchmark on the 4
+labeled matches (stored tracking, no GPU needed; prints missed / fake / maybes /
+accurate per detector, with the difference from the saved baseline):
+
+```bash
+uv run --package worker python worker/benchmark.py
+uv run --package worker python worker/benchmark.py --save-baseline   # after an intended change
 ```
 
 ## Database changes (migrations)
@@ -279,6 +293,9 @@ uv run --package worker python worker/run_worker.py --batch-size 16  # on an NVI
 
 It checks the queue every 5 s (`--poll`), takes the oldest queued video, and sets it to
 `processing` → `done` (rallies saved) or `failed` (with the error in `error`).
+The rally detector comes from `DETECTOR_VERSION` in `.env` (`v1.1` by default, `v1` for
+the old rules); each video records the version that made its rallies, and
+re-analyzing a video (`POST /videos/{id}/process`) uses the current one.
 Reprocessing a video replaces its old rallies, in the same transaction that marks it
 done, so the app never sees half-saved results. A failed reprocess keeps the old ones.
 

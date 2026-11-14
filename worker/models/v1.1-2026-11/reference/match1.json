@@ -1,0 +1,42 @@
+{
+  "csv": "results/match1/tracknet_fast.csv",
+  "court": "results/match1/court.json",
+  "fps": 30.0,
+  "rallies": [
+    {
+      "start": 2.2,
+      "end": 13.5,
+      "duration": 11.3,
+      "confidence": 0.9986,
+      "is_maybe": false
+    },
+    {
+      "start": 21.1,
+      "end": 24.07,
+      "duration": 2.97,
+      "confidence": 0.9826,
+      "is_maybe": false
+    },
+    {
+      "start": 32.8,
+      "end": 36.17,
+      "duration": 3.37,
+      "confidence": 0.9962,
+      "is_maybe": false
+    },
+    {
+      "start": 46.3,
+      "end": 52.67,
+      "duration": 6.37,
+      "confidence": 0.9631,
+      "is_maybe": false
+    },
+    {
+      "start": 57.47,
+      "end": 63.03,
+      "duration": 5.56,
+      "confidence": 0.9984,
+      "is_maybe": false
+    }
+  ]
+}

@@ -7,7 +7,7 @@ Corners are fractions 0-1 of the frame width/height, in the order
 far-left, far-right, near-right, near-left (the API's format). Pixels exist only
 inside this module.
 
-Steps: downscale to 720p -> thumbnail strip (sprite sheets for the app's scrubber)
+Steps: analysis copy (512x288) -> thumbnail strip (sprite sheets for the app's scrubber)
 -> TrackNet shuttle tracking (fast mode) -> trajectory file
 (shuttle positions as fractions, for the app's shuttle trail) -> court.json
 -> rule-based rally detection. Intermediate files go to --work-dir.
@@ -24,7 +24,7 @@ import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from detector import detect_rallies
+from detector import DEFAULT_DETECTOR, DETECTORS, detect_rallies
 from job_errors import VideoUnreadable
 from tracknet.infer import track_shuttle
 from thumbnail_strip import DIRNAME as THUMBNAILS_DIRNAME
@@ -35,7 +35,14 @@ from trajectory_file import write_trajectory
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CKPT = os.path.join(WORKER_DIR, "ckpts", "TrackNet_best.pt")
 CORNER_NAMES = ["far-left", "far-right", "near-right", "near-left"]
-TARGET_HEIGHT = 720
+# The analysis copy: videos bigger than ANALYSIS_MAX are re-encoded to ANALYSIS_HEIGHT
+# (aspect ratio kept; 512x288 for 16:9). TrackNet shrinks every frame to 512x288
+# anyway, so a bigger copy only costs decoding and resizing time. Measured on the 4
+# labeled matches (Modal T4): tracking 22 s per video-minute instead of 56-66 s at
+# 720p, same accuracy (v1: missed 17 vs 19, accurate 100 vs 94 of 141 within 2 s;
+# v1.1: missed 9 vs 9, accurate 105 vs 104, fake 6 vs 2).
+ANALYSIS_MAX = (640, 360)
+ANALYSIS_HEIGHT = 288
 
 
 def video_info(path):
@@ -56,13 +63,16 @@ def video_info(path):
     return info
 
 
-def downscale(src, dst):
-    """Re-encode to 720p. No -r: forcing a frame rate on phone video broke timestamps before."""
-    if video_info(src)["height"] <= TARGET_HEIGHT:
+def downscale(src, dst, height=ANALYSIS_HEIGHT, max_size=ANALYSIS_MAX):
+    """Re-encode to `height` (width keeps the aspect ratio, rounded to even) if the
+    video is bigger than max_size. No -r: forcing a frame rate on phone video broke
+    timestamps before."""
+    info = video_info(src)
+    if info["width"] <= max_size[0] and info["height"] <= max_size[1]:
         return src  # already small enough; re-encoding would only lose quality
     result = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
-         "-vf", f"scale=-2:{TARGET_HEIGHT}", "-c:v", "libx264", "-an", dst],
+         "-vf", f"scale=-2:{height}", "-c:v", "libx264", "-an", dst],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -79,8 +89,9 @@ def write_court_json(corners, width, height, path):
 
 
 def process_video(video_path, corners, work_dir, ckpt_path=DEFAULT_CKPT, batch_size=4,
-                  on_progress=None, log=print):
-    """Find rallies in video_path. corners: 4 (x, y) fractions. Returns [{start, end, duration}] in seconds.
+                  on_progress=None, log=print, detector=DEFAULT_DETECTOR):
+    """Find rallies in video_path. corners: 4 (x, y) fractions. Returns detector.detect_rallies'
+    {"detector_version", "rallies": [{start, end, duration, confidence, is_maybe}]} (seconds).
     on_progress(fraction 0-1) is called during tracking, the slow step."""
     # Same limits as the API (app.models.COURT_MARGIN_MAX): corners may be off-screen
     # by up to 30% of the frame; pixel coordinates are then negative or past the edge.
@@ -90,7 +101,7 @@ def process_video(video_path, corners, work_dir, ckpt_path=DEFAULT_CKPT, batch_s
 
     # One log line per phase; the caller logs tracking progress via on_progress
     t0 = time.time()
-    video = downscale(video_path, os.path.join(work_dir, "video_720.mp4"))
+    video = downscale(video_path, os.path.join(work_dir, "analysis.mp4"))
     info = video_info(video)
     t1 = time.time()
     # From the analysis copy: same frames and timing as the original, faster to decode
@@ -110,10 +121,10 @@ def process_video(video_path, corners, work_dir, ckpt_path=DEFAULT_CKPT, batch_s
                      os.path.join(work_dir, TRAJECTORY_FILENAME))
 
     court_path = write_court_json(corners, info["width"], info["height"], os.path.join(work_dir, "court.json"))
-    rallies = detect_rallies(csv_path, video, court_path)
+    result = detect_rallies(csv_path, video, court_path, detector=detector, fps=info["fps"])
     with open(os.path.join(work_dir, "rallies.json"), "w") as fh:
-        json.dump({"fps": info["fps"], "rallies": rallies}, fh, indent=2)
-    return rallies
+        json.dump({"fps": info["fps"], **result}, fh, indent=2)
+    return result
 
 
 def parse_corners(text):
@@ -133,6 +144,7 @@ def main():
     parser.add_argument("--work-dir", default=None, help="default: worker/output/<video name>")
     parser.add_argument("--ckpt", default=DEFAULT_CKPT)
     parser.add_argument("--batch-size", type=int, default=4, help="4 on the Mac, 16 on the RTX 2070")
+    parser.add_argument("--detector", choices=sorted(DETECTORS), default=DEFAULT_DETECTOR)
     args = parser.parse_args()
 
     name = os.path.splitext(os.path.basename(args.video))[0]
@@ -145,11 +157,13 @@ def main():
             print(f"  tracking {pct}%", flush=True)
             last[0] = pct
 
-    rallies = process_video(args.video, parse_corners(args.corners), work_dir,
-                            ckpt_path=args.ckpt, batch_size=args.batch_size, on_progress=show_progress)
+    result = process_video(args.video, parse_corners(args.corners), work_dir, ckpt_path=args.ckpt,
+                           batch_size=args.batch_size, on_progress=show_progress, detector=args.detector)
+    rallies = result["rallies"]
     for i, r in enumerate(rallies, 1):
-        print(f"Rally {i:>3}: {fmt(r['start'])} - {fmt(r['end'])}  ({r['duration']:5.1f}s)")
-    print(f"\n{len(rallies)} rallies. Outputs in {work_dir}")
+        maybe = f"  maybe ({r['confidence']:.2f})" if r["is_maybe"] else ""
+        print(f"Rally {i:>3}: {fmt(r['start'])} - {fmt(r['end'])}  ({r['duration']:5.1f}s){maybe}")
+    print(f"\n{len(rallies)} rallies ({result['detector_version']}). Outputs in {work_dir}")
 
 
 if __name__ == "__main__":

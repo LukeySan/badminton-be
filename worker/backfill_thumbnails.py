@@ -6,8 +6,8 @@ Make thumbnail strips for videos analyzed before the worker made them.
     uv run --package worker python worker/backfill_thumbnails.py --video <id> --force
 
 Only `done` videos (a video being processed gets its strip from the worker).
-Uses the analysis copy (work/video_720.mp4) when it's still there, else the
-original. Needs ffmpeg, not torch, and can run while workers are running. Safe to
+Uses the analysis copy (work/analysis.mp4, or work/video_720.mp4 from older runs)
+when it's still there, else the original. Needs ffmpeg, not torch, and can run while workers are running. Safe to
 run again: videos that already have a strip are skipped unless --force.
 """
 
@@ -33,10 +33,14 @@ from thumbnail_strip import generate_thumbnails  # noqa: E402
 logger = logging.getLogger("backfill")
 
 
+ANALYSIS_COPIES = ("analysis.mp4", "video_720.mp4")  # current name, then older runs'
+
+
 def source_video(video: Video) -> Path:
-    analysis_copy = settings.STORAGE_DIR / str(video.id) / "work" / "video_720.mp4"
-    if analysis_copy.exists():
-        return analysis_copy
+    work = settings.STORAGE_DIR / str(video.id) / "work"
+    for name in ANALYSIS_COPIES:
+        if (work / name).exists():
+            return work / name
     return settings.STORAGE_DIR / video.storage_path
 
 

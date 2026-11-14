@@ -52,24 +52,28 @@ def write_track(path: Path, in_court_frames: int) -> str:
     return str(path)
 
 
-def test_court_not_visible(video: Path, court: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("detector", ["v1", "v1.1"])
+def test_court_not_visible(video: Path, court: str, tmp_path: Path, detector: str) -> None:
     csv = write_track(tmp_path / "ball.csv", in_court_frames=0)
     with pytest.raises(CourtNotVisible, match=r"in 0\.0% of frames"):
-        detect_rallies(csv, str(video), court)
+        detect_rallies(csv, str(video), court, detector=detector)
 
 
-def test_court_visibility_threshold(video: Path, court: str, tmp_path: Path) -> None:
+@pytest.mark.parametrize("detector", ["v1", "v1.1"])
+def test_court_visibility_threshold(video: Path, court: str, tmp_path: Path, detector: str) -> None:
     just_below = int(FRAMES * MIN_SHUTTLE_IN_COURT) - 3  # 4% of frames
     with pytest.raises(CourtNotVisible):
-        detect_rallies(write_track(tmp_path / "a.csv", just_below), str(video), court)
+        detect_rallies(write_track(tmp_path / "a.csv", just_below), str(video), court, detector=detector)
     enough = int(FRAMES * MIN_SHUTTLE_IN_COURT) + 3  # 6% of frames
-    detect_rallies(write_track(tmp_path / "b.csv", enough), str(video), court)
+    detect_rallies(write_track(tmp_path / "b.csv", enough), str(video), court, detector=detector)
 
 
 def test_shuttle_in_court_finds_a_rally(video: Path, court: str, tmp_path: Path) -> None:
-    rallies = detect_rallies(write_track(tmp_path / "ball.csv", 150), str(video), court)
-    assert len(rallies) == 1
-    assert rallies[0]["start"] == pytest.approx(0.0, abs=0.3)
+    result = detect_rallies(write_track(tmp_path / "ball.csv", 150), str(video), court, detector="v1")
+    assert result["detector_version"] == "v1"
+    [rally] = result["rallies"]
+    assert rally["start"] == pytest.approx(0.0, abs=0.3)
+    assert (rally["confidence"], rally["is_maybe"]) == (None, False)
 
 
 def test_unreadable_video(tmp_path: Path) -> None:
@@ -84,3 +88,31 @@ def test_unreadable_video(tmp_path: Path) -> None:
 def test_readable_video(video: Path) -> None:
     info = video_info(str(video))
     assert (info["width"], info["height"], info["fps"]) == (W, H, FPS)
+
+
+def make_clip(path: Path, size: str, seconds: float = 1.0) -> str:
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc=duration={seconds}:size={size}:rate={FPS}",
+         "-pix_fmt", "yuv420p", str(path)],
+        check=True,
+    )
+    return str(path)
+
+
+@pytest.mark.parametrize(("size", "expected"), [
+    ("1280x720", (512, 288)),    # phone video, 16:9
+    ("1920x1080", (512, 288)),
+    ("1440x1080", (384, 288)),   # 4:3 keeps its shape
+    ("854x480", (512, 288)),     # just above 640x360
+])
+def test_analysis_copy_is_288_high(tmp_path: Path, size: str, expected: tuple[int, int]) -> None:
+    src = make_clip(tmp_path / "in.mp4", size)
+    out = downscale(src, str(tmp_path / "analysis.mp4"))
+    info, original = video_info(out), video_info(src)
+    assert (info["width"], info["height"]) == expected
+    assert (info["fps"], info["frames"]) == (original["fps"], original["frames"])  # same timeline
+
+
+def test_small_video_is_used_as_is(tmp_path: Path) -> None:
+    src = make_clip(tmp_path / "in.mp4", "640x360")
+    assert downscale(src, str(tmp_path / "analysis.mp4")) == src
