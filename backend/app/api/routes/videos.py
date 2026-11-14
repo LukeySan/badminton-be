@@ -8,16 +8,21 @@ from fastapi import APIRouter, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlmodel import Session
 
-from app import crud, media
+from app import crud, media, thumbnails, trajectory
 from app.api.deps import CurrentUser, SessionDep
+from app.api.errors import CodedHTTPException
 from app.core.config import settings
 from app.core.security import create_file_token, verify_file_token
 from app.core.upload_limit import format_bytes
 from app.models import (
     CourtUpdate,
+    ErrorCode,
+    ErrorWithCode,
     FileUrl,
     Message,
     RalliesPublic,
+    ThumbnailUrls,
+    TrajectoryPublic,
     User,
     Video,
     VideoPublic,
@@ -28,6 +33,7 @@ router = APIRouter(prefix="/videos", tags=["videos"])
 
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv", ".webm"}
 CHUNK = 1024 * 1024
+MAX_TRAJECTORY_SECONDS = 600  # per request: ~18,000 points at 30 fps
 
 # Handlers are plain `def` (not async): FastAPI runs them in a thread pool, so slow
 # file copies and ffmpeg calls don't block other requests.
@@ -273,10 +279,60 @@ def read_video_rallies(
     session: SessionDep, current_user: CurrentUser, id: uuid.UUID
 ) -> Any:
     """
-    Detected rallies, in seconds, ordered by start time.
+    The video's rallies (detected, then corrected by the user), in seconds,
+    numbered in time order.
     """
     video = get_video_for_user(session, current_user, id)
-    return RalliesPublic(data=video.rallies, count=len(video.rallies))  # type: ignore[arg-type]
+    rallies = crud.numbered_rallies(session=session, video_id=video.id)
+    return RalliesPublic(data=rallies, count=len(rallies))
+
+
+@router.get(
+    "/{id}/trajectory",
+    response_model=TrajectoryPublic,
+    responses={
+        404: {
+            "model": ErrorWithCode,
+            "description": "code `trajectory_missing`: the video was analyzed before "
+            "trajectories were saved (or not analyzed yet); re-analyzing it adds one. "
+            "A video that doesn't exist gives a plain 404 without a code.",
+        },
+    },
+)
+def read_video_trajectory(
+    session: SessionDep,
+    current_user: CurrentUser,
+    id: uuid.UUID,
+    start: Annotated[float, Query(ge=0, description="Seconds")],
+    end: Annotated[float, Query(ge=0, description="Seconds")],
+) -> Any:
+    """
+    Shuttle positions for every frame from `start` to `end` (seconds), as fractions
+    of the frame like the court corners. For drawing the shuttle trail.
+    At most 600 seconds per request.
+    """
+    video = get_video_for_user(session, current_user, id)
+    if end <= start:
+        raise HTTPException(status_code=422, detail="end must be after start")
+    if end - start > MAX_TRAJECTORY_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"At most {MAX_TRAJECTORY_SECONDS} seconds per request",
+        )
+    track = trajectory.load_trajectory(video.id)
+    if track is None:
+        raise CodedHTTPException(
+            404,
+            ErrorCode.TRAJECTORY_MISSING,
+            "This video has no shuttle trajectory yet; re-analyze it to enable "
+            "the shuttle trail",
+        )
+    return TrajectoryPublic(
+        fps=track.fps,
+        start=start,
+        end=end,
+        points=trajectory.points_between(track, start, end),
+    )
 
 
 @router.get("/{id}/file-url", response_model=FileUrl)
@@ -294,6 +350,73 @@ def read_video_file_url(
     return FileUrl(
         url=f"{settings.API_V1_STR}/videos/{id}/file?token={token}",
         expires_at=expires_at,
+    )
+
+
+@router.get(
+    "/{id}/thumbnails-url",
+    response_model=ThumbnailUrls,
+    responses={
+        404: {
+            "model": ErrorWithCode,
+            "description": "code `thumbnails_missing`: analyzed before thumbnails "
+            "existed, or not analyzed yet (see the backfill command). A video that "
+            "doesn't exist gives a plain 404 without a code.",
+        }
+    },
+)
+def read_video_thumbnails_url(
+    session: SessionDep, current_user: CurrentUser, id: uuid.UUID
+) -> Any:
+    """
+    Temporary links (12 h) to the thumbnail strip: one small frame per second,
+    packed into sprite sheets. Fetch `index_url` for the layout (interval, tile
+    size, columns, rows, count), then the sheets as needed.
+    """
+    get_video_for_user(session, current_user, id)
+    index = thumbnails.read_index(id)
+    if index is None:
+        raise CodedHTTPException(
+            404,
+            ErrorCode.THUMBNAILS_MISSING,
+            "This video has no thumbnails yet",
+        )
+    # One token per video covers all its files (video, thumbnails)
+    token, expires_at = create_file_token(id)
+    base = f"{settings.API_V1_STR}/videos/{id}/thumbnails"
+    return ThumbnailUrls(
+        index_url=f"{base}/{thumbnails.INDEX}?token={token}",
+        sheet_urls=[f"{base}/{name}?token={token}" for name in index["sheets"]],
+        expires_at=expires_at,
+    )
+
+
+@router.get(
+    "/{id}/thumbnails/{name}",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"image/jpeg": {}, "application/json": {}}},
+        403: {"description": "Invalid or expired link"},
+    },
+)
+def read_video_thumbnail_file(
+    id: uuid.UUID,
+    name: str,
+    token: Annotated[str, Query(description="From GET /videos/{id}/thumbnails-url")],
+) -> FileResponse:
+    """
+    One file of the thumbnail strip: `index.json` or a sheet (`sheet_000.jpg`...).
+    """
+    if not verify_file_token(token, id):
+        raise HTTPException(status_code=403, detail="Invalid or expired file link")
+    path = thumbnails.file_path(id, name)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(
+        path,
+        media_type="application/json" if name == thumbnails.INDEX else "image/jpeg",
+        # The link is private (signed) and the files only change on re-analysis
+        headers={"Cache-Control": "private, max-age=3600"},
     )
 
 

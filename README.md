@@ -14,18 +14,22 @@ The API is built on the
 FastAPI, SQLModel, PostgreSQL, Alembic migrations, JWT login, pytest.
 
 > **Status: beta prototype.** Working end to end: upload → mark court → queue → the
-> worker finds the rallies → `GET /videos/{id}/rallies`. Not yet: rally corrections,
-> deployment.
+> worker finds the rallies → `GET /videos/{id}/rallies`, rally corrections, thumbnail
+> strips, reels (highlight edit lists), shuttle trajectories. Not yet: deployment.
 
 ## Repo layout
 
 ```
 backend/             FastAPI API (the template's "app" package)
   app/
-    api/routes/        endpoints: login, users, utils, videos
+    api/routes/        endpoints: login, users, utils, health, videos, rallies, reels
+    api/errors.py      errors with a machine-readable code (trajectory_missing, ...)
     models.py          database tables + API input/output models (SQLModel)
     crud.py            database operations, incl. video status changes
     media.py           ffprobe/ffmpeg helpers (video info, frames)
+    trajectory.py      reads the per-video shuttle trajectory file
+    thumbnails.py      finds the per-video thumbnail strip files
+    reel_ops.py        adjusts reels when rallies change (pure functions)
     core/              settings, database engine, password + token security
     alembic/versions/  database migrations
   tests/             pytest (incl. the worker loop, with a fake pipeline)
@@ -33,10 +37,13 @@ backend/             FastAPI API (the template's "app" package)
 worker/              processing: downscale → TrackNet shuttle tracking → rally detection
   run_worker.py        the job loop: claims queued videos, runs the pipeline
   pipeline.py          one video in, rallies out (also a CLI)
+  trajectory_file.py   writes the shuttle trajectory file the API serves
+  thumbnail_strip.py   makes the thumbnail strip (sprite sheets + index.json)
+  backfill_thumbnails.py  thumbnail strips for videos analyzed before they existed
   tracknet/            TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/               model weights (not in git, see below)
 compose.yml          local Postgres, Adminer (DB browser), Mailpit (test emails)
-storage/             uploaded videos (created on first upload, not in git)
+storage/             per video: original, thumbnails/, trajectory.json.gz, work/ (not in git)
 ```
 
 The API and worker share one repo (and one uv environment) because the worker uses the
@@ -109,7 +116,20 @@ own videos; the superuser sees all.
 | `GET /videos/{id}/frame?t=1` | JPEG frame for marking the court |
 | `PUT /videos/{id}/court` | 4 court corners as fractions of the frame, order far-left, far-right, near-right, near-left. 0-1 is inside the frame; corners may be off-screen (see below). Not allowed while queued/processing. |
 | `POST /videos/{id}/process` | Queue for processing (409 if already queued or no court yet; done/failed videos can be queued again). At most 2 of a user's videos queued or processing at once (429) |
-| `GET /videos/{id}/rallies` | `{data: [{id, start, end, duration}], count}`, seconds |
+| `GET /videos/{id}/rallies` | `{data: [{id, number, start, end, duration}], count}`, seconds, `number` = 1, 2, 3... in time order |
+| `POST /videos/{id}/rallies` | Add a rally `{start, end}` (rally corrections, see below) |
+| `PUT /videos/{id}/rallies/{rally_id}` | Set a rally's `{start, end}` |
+| `DELETE /videos/{id}/rallies/{rally_id}` | Delete a rally |
+| `POST /videos/{id}/rallies/{rally_id}/split` | Split it in two at `{at}` seconds |
+| `POST /videos/{id}/rallies/merge` | Merge two neighbouring rallies `{rally_ids: [a, b]}` into a new one |
+| `GET /videos/{id}/thumbnails-url` | Signed links (12 h) to the thumbnail strip: `{index_url, sheet_urls, expires_at}`. 404 with `code: "thumbnails_missing"` before it exists |
+| `GET /videos/{id}/thumbnails/{name}?token=...` | `index.json` or a sheet (`sheet_000.jpg`) |
+| `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved. Still saved for every video; nothing in the app depends on it now |
+| `GET /videos/{id}/reels` | The video's reels, most recently saved first: `{data, count}` |
+| `POST /videos/{id}/reels` | Create a reel `{title, edit}` (see Reels below) |
+| `GET /reels/{id}` | One reel with its edit list |
+| `PUT /reels/{id}` | Save: replaces title and edit list. Send the `updated_at` you loaded; 409 with `code: "reel_changed"` if it was saved elsewhere since |
+| `DELETE /reels/{id}` | Soft delete (hidden, row kept) |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
 
@@ -119,6 +139,82 @@ videos piling up with nothing processing means no worker is running.
 
 Plus the template's endpoints: login, password recovery, signup, `/users/me`, user
 admin, health check.
+
+**Error codes.** Errors are `{"detail": "..."}` as usual. The few the app reacts to with
+something other than showing the message also carry a `code`
+(`{"detail": "...", "code": "trajectory_missing"}`); match on the code, never the text.
+
+**Reels** are non-destructive highlight edits: the original video is never changed; a
+reel is an edit list the app plays back. All times are seconds in the original video.
+
+```jsonc
+{
+  "version": 2,
+  "view": "cut",            // "cut" (rallies only) or "full"
+  "format": "16:9",         // or "9:16"
+  "lead_in": 1.0,           // pieces may start up to this long before their rally (0-3 s)
+  "lead_out": 1.0,          // ...and end this long after it (0-3 s)
+  "clips": [                // in reel order, one rally each
+    {"rally_id": 271, "pieces": [               // sorted, not overlapping (may touch)
+      {"start": 1.5, "end": 3.0, "slow_mo": false},
+      {"start": 3.0, "end": 5.2, "slow_mo": true}   // a split: two touching pieces
+    ]}
+  ],
+  "restored_gaps": [{"start": 4.43, "end": 6.0}],   // breaks shown again in cut view
+  "overlays": {"trail": true, "captions": [{"text": "What a smash", "start": 3, "end": 4}]}
+}
+```
+
+Splitting a piece makes two pieces; deleting a piece removes it; a clip with no pieces
+left is dropped when the reel is saved. Rejected with 422 (with the usual `loc`, e.g.
+`["body","edit","clips",0,"pieces",1,"end"]`): a `rally_id` that isn't one of the
+video's rallies, a piece outside its rally's bounds widened by `lead_in`/`lead_out`,
+times past the end of the video (0.1 s tolerance), unsorted or overlapping pieces,
+captions over 80 characters, unknown fields, `version` other than 2.
+
+v1 (one `trim_start`/`trim_end` per clip) was converted by a migration: each trim became
+one piece, with `lead_in`/`lead_out` raised (up to 3 s) so the old trims still fit.
+
+**Rally corrections** (add, edit, delete, split, merge) each return what changed:
+
+```jsonc
+{
+  "added": [{"id": 3477, "number": 2, "start": 6.0, "end": 8.0, "duration": 2.0}],
+  "updated": [{"id": 3474, "number": 1, "start": 2.0, "end": 6.0, "duration": 4.0}],
+  "deleted": [],
+  "rallies": [ /* the whole list, renumbered in time order */ ],
+  "reels": [{"id": "...", "title": "Best rallies", "updated_at": "...",
+             "clips_removed": 0, "pieces_trimmed": 1, "pieces_removed": 0}]
+}
+```
+
+- Rallies can't overlap (touching is fine): 409 otherwise. Merge only takes neighbours.
+  Not allowed while the video is queued or processing (409): re-analysis replaces all
+  rallies.
+- Reels follow: pieces outside a rally's new bounds (+ lead) are trimmed; a deleted
+  rally's clips are dropped; a split splits the clip the same way; a merge points both
+  rallies' clips at the new rally and joins a clip of the first directly followed by one
+  of the second. Changed reels get a new `updated_at`, so an editor with an old copy
+  gets 409 `reel_changed` and reloads.
+- Every change is logged in the `correction` table with the detector's original bounds
+  (kept on each rally as `detected_start`/`detected_end`), the new bounds and who made
+  it: detector output vs. the user's correction, for training a better detector later.
+- Re-analyzing a video replaces all its rallies (corrections included) with the
+  detector's; reel clips move to the new rally overlapping them most.
+
+**Thumbnail strip.** One 160 px wide frame per second, in sprite sheets of 10 x 10
+tiles. Fetch `index_url` first:
+
+```json
+{"version": 1, "interval": 1.0, "count": 425, "tile_width": 160, "tile_height": 90,
+ "columns": 10, "rows": 10, "sheets": ["sheet_000.jpg", "sheet_001.jpg", "..."]}
+```
+
+The frame at `t` seconds is tile `i = floor(t / interval)` (up to `count - 1`): in sheet
+`i // (columns * rows)` (its URL is `sheet_urls[...]`), at column `i % columns`, row
+`(i // columns) % rows`. Several sheets rather than one tall image: an hour would be one
+1600 x 32,400 image, more than phones decode reliably, and the app can load only the
+sheets near the playhead.
 
 **Why `file-url`:** a browser `<video src="...">` can't send the `Authorization` header.
 Instead of putting the 8-day login token in a URL (where it ends up in logs and
@@ -203,14 +299,30 @@ same database:
   asleep) stops when it wakes up instead of overwriting the other worker's results.
 - **Ctrl+C** puts the current video straight back in the queue.
 
-Intermediate files go to `storage/<video id>/work/`.
+Intermediate files go to `storage/<video id>/work/`. Two outputs for the app are moved
+to `storage/<video id>/` just before the video is marked done, so "done" always comes
+with them (a failed run keeps the old ones):
+
+- `thumbnails/`: the thumbnail strip, made from the 720p analysis copy right after the
+  downscale (~3 s for 7 minutes; ~320 KB per sheet of 100 tiles).
+- `trajectory.json.gz`: the shuttle position per frame (visible + x/y as fractions,
+  gzipped JSON, ~50 KB for 21 minutes).
+
+Videos analyzed before thumbnails existed get them from the backfill command (needs
+ffmpeg, not torch; safe to run while workers run, and to run again):
+
+```bash
+uv run --package worker python worker/backfill_thumbnails.py --dry-run   # what's missing
+uv run --package worker python worker/backfill_thumbnails.py             # make them
+uv run --package worker python worker/backfill_thumbnails.py --video <id> --force
+```
 
 **Log lines.** One line per phase, prefixed with the video's short id so jobs from
 several workers can be told apart:
 
 ```
 [588c9f87] claimed: clipped_vid.mp4, 1.1 min, attempt 1/3
-[588c9f87] prepared: 1280x720, 30.00 fps, 1.1 min (downscale 6s)
+[588c9f87] prepared: 1280x720, 30.00 fps, 1.1 min (downscale 6s, thumbnails 1s)
 [588c9f87] tracking 10%        ... one line per 10%
 [588c9f87] detecting rallies (tracking took 41s)
 [588c9f87] done: 6 rallies (0.3 min of play) in 48s

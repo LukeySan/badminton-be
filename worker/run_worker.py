@@ -30,7 +30,7 @@ from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
 from sqlmodel import Session
 
-from app import crud
+from app import crud, thumbnails, trajectory
 from app.core.config import settings
 from app.core.db import engine as default_engine
 from app.models import FailureReason
@@ -39,6 +39,8 @@ WORKER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORKER_DIR))  # for `import pipeline`, `import job_errors`
 
 from job_errors import CourtNotVisible, PipelineError, VideoUnreadable  # noqa: E402
+from thumbnail_strip import replace_dir  # noqa: E402
+from trajectory_file import FILENAME as TRAJECTORY_FILENAME  # noqa: E402
 
 HEARTBEAT_SECONDS = 5.0
 STALE_AFTER = timedelta(minutes=2)
@@ -87,6 +89,19 @@ class JobLog:
 
     def exception(self, message: str) -> None:
         logger.exception("%s %s", self.prefix, message)  # with traceback
+
+
+def publish_outputs(work_dir: Path, video_id: uuid.UUID) -> None:
+    """Move the pipeline's files for the app (shuttle trajectory, thumbnail strip)
+    from the work folder to where the API reads them. Renames, so the API sees the
+    old version or the new one, never half of one. Before the video is marked done,
+    so "done" always comes with the new files; a failed run keeps the old ones."""
+    src = work_dir / TRAJECTORY_FILENAME
+    if src.exists():
+        os.replace(src, trajectory.trajectory_path(video_id))
+    src = work_dir / thumbnails.DIRNAME
+    if src.is_dir():
+        replace_dir(str(src), str(thumbnails.thumbnails_dir(video_id)))
 
 
 class JobLost(Exception):
@@ -251,6 +266,7 @@ def process_one(
         return True
     heartbeat.stop()
 
+    publish_outputs(work_dir, video_id)
     with Session(engine) as session:
         saved = crud.finish_video(
             session=session,

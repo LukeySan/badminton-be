@@ -7,7 +7,9 @@ Corners are fractions 0-1 of the frame width/height, in the order
 far-left, far-right, near-right, near-left (the API's format). Pixels exist only
 inside this module.
 
-Steps: downscale to 720p -> TrackNet shuttle tracking (fast mode) -> court.json
+Steps: downscale to 720p -> thumbnail strip (sprite sheets for the app's scrubber)
+-> TrackNet shuttle tracking (fast mode) -> trajectory file
+(shuttle positions as fractions, for the app's shuttle trail) -> court.json
 -> rule-based rally detection. Intermediate files go to --work-dir.
 """
 
@@ -25,6 +27,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from detector import detect_rallies
 from job_errors import VideoUnreadable
 from tracknet.infer import track_shuttle
+from thumbnail_strip import DIRNAME as THUMBNAILS_DIRNAME
+from thumbnail_strip import generate_thumbnails
+from trajectory_file import FILENAME as TRAJECTORY_FILENAME
+from trajectory_file import write_trajectory
 
 WORKER_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CKPT = os.path.join(WORKER_DIR, "ckpts", "TrackNet_best.pt")
@@ -86,14 +92,22 @@ def process_video(video_path, corners, work_dir, ckpt_path=DEFAULT_CKPT, batch_s
     t0 = time.time()
     video = downscale(video_path, os.path.join(work_dir, "video_720.mp4"))
     info = video_info(video)
+    t1 = time.time()
+    # From the analysis copy: same frames and timing as the original, faster to decode
+    generate_thumbnails(video, os.path.join(work_dir, THUMBNAILS_DIRNAME))
     log(f"prepared: {info['width']}x{info['height']}, {info['fps']:.2f} fps, "
-        f"{info['duration'] / 60:.1f} min (downscale {time.time() - t0:.0f}s)")
+        f"{info['duration'] / 60:.1f} min (downscale {t1 - t0:.0f}s, "
+        f"thumbnails {time.time() - t1:.0f}s)")
 
     t0 = time.time()
     csv_path = os.path.join(work_dir, "ball.csv")
     track_shuttle(video, ckpt_path, csv_path, batch_size=batch_size,
                   on_progress=on_progress and (lambda done, total: on_progress(done / max(total, 1))))
     log(f"detecting rallies (tracking took {time.time() - t0:.0f}s)")
+    # Same frames and timing as the original (no -r when downscaling), so frame / fps
+    # is a time in the original video, and fractions don't depend on the resolution
+    write_trajectory(csv_path, info["width"], info["height"], info["fps"],
+                     os.path.join(work_dir, TRAJECTORY_FILENAME))
 
     court_path = write_court_json(corners, info["width"], info["height"], os.path.join(work_dir, "court.json"))
     rallies = detect_rallies(csv_path, video, court_path)
