@@ -1,4 +1,5 @@
 import itertools
+import re
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -17,6 +18,8 @@ from pydantic import Field as PydanticField
 from sqlalchemy import Column, DateTime, Index, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Relationship, SQLModel
+
+from app.core.config import settings
 
 
 def get_datetime_utc() -> datetime:
@@ -121,6 +124,13 @@ def is_court_out_of_frame(corners: Sequence[Sequence[float]]) -> bool:
         for point in corners
         for v in point
     )
+
+
+def detector_release(version: str) -> tuple[int, ...] | None:
+    """'v1.1-2026-11' -> (1, 1), 'v1' -> (1,); None for names that aren't releases
+    (e.g. the test fixture's 'test-fixture'), which are never called outdated."""
+    match = re.fullmatch(r"v(\d+(?:\.\d+)*)(?:-.*)?", version)
+    return tuple(int(part) for part in match.group(1).split(".")) if match else None
 
 
 class CourtUpdate(SQLModel):
@@ -241,6 +251,18 @@ class VideoPublic(SQLModel):
             self.court_corners
         )
 
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def detector_outdated(self) -> bool:
+        """A newer detector than the one that made these rallies is in use, so the
+        app can offer to re-analyze. False until processed, and after a rollback to
+        an older detector (re-analyzing would make it worse)."""
+        if self.detector_version is None:
+            return False
+        made_with = detector_release(self.detector_version)
+        current = detector_release(settings.DETECTOR_VERSION)
+        return made_with is not None and current is not None and made_with < current
+
 
 class VideosPublic(SQLModel):
     data: list[VideoPublic]
@@ -308,7 +330,9 @@ class RalliesPublic(SQLModel):
 
 MIN_RALLY_SECONDS = 0.1  # shortest rally (or part of a split) a user can make
 
-CorrectionAction = Literal["add", "edit", "delete", "split", "merge", "confirm"]
+CorrectionAction = Literal[
+    "add", "edit", "delete", "split", "merge", "confirm", "unconfirm"
+]
 
 
 class Correction(SQLModel, table=True):

@@ -467,3 +467,208 @@ def test_processor_without_a_trajectory_still_finishes(
     run(engine, lambda *_: detection({"start": 1.0, "end": 2.0}))
     assert fetch(engine, video_id).status == "done"
     assert not trajectory.trajectory_path(video_id).exists()
+
+
+# --- a failing job never stops the worker ----------------------------------------
+
+
+def stop_when_idle(monkeypatch: pytest.MonkeyPatch, idle_polls: int = 1) -> None:
+    """End serve_forever like Ctrl+C at the `idle_polls`-th wait for new jobs."""
+    polls = 0
+
+    def sleep(_seconds: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls >= idle_polls:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(time, "sleep", sleep)  # what run_worker waits with
+
+
+def serve(engine: Engine, processor: run_worker.Processor, **kwargs: Any) -> None:
+    run_worker.serve_forever(
+        processor,
+        "test-worker",
+        engine=engine,
+        heartbeat_seconds=FAST_BEAT,
+        poll_seconds=0,
+        **kwargs,
+    )
+
+
+def test_worker_survives_a_failing_detection(
+    db: Session,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Detection raising fails that one video (short reason for the user, details
+    internally) and the loop goes on to the next job."""
+    broken = make_video(db, age=timedelta(minutes=1))  # oldest: claimed first
+    fine = make_video(db)
+
+    def processor(
+        _path: Path,
+        _corners: list[list[float]],
+        work_dir: Path,
+        _progress: ProgressFn,
+        log: LogFn,
+    ) -> run_worker.Detection:
+        if work_dir.parent.name == str(broken):
+            log("detecting rallies (tracking took 1s)")
+            raise TypeError("string indices must be integers, not 'str'")
+        return detection({"start": 1.0, "end": 4.0})
+
+    stop_when_idle(monkeypatch)
+    caplog.set_level("INFO", logger="worker")
+    serve(engine, processor)
+
+    failed = fetch(engine, broken)
+    assert (failed.status, failed.claim_id) == ("failed", None)
+    assert failed.failure_reason == FailureReason.UNKNOWN
+    assert failed.error == "TypeError: string indices must be integers, not 'str'"
+    assert fetch(engine, fine).status == "done"
+    assert rallies_of(engine, fine) == [(1.0, 4.0)]
+    assert worker_lines(caplog)[-1] == "Worker stopped"
+
+
+@pytest.mark.parametrize(
+    ("result", "error"),
+    [
+        # What happened on 2026-11-14 the other way round: loop and pipeline from
+        # different versions of the code (here: a pre-v1.1 pipeline's plain list)
+        (
+            [{"start": 1.0, "end": 4.0}],
+            "TypeError: pipeline returned list, expected {detector_version, "
+            "rallies}: restart the worker after code changes",
+        ),
+        (
+            {"detector_version": "v1.1-2026-11", "rallies": [{"end": 4.0}]},
+            "KeyError: 'start'",
+        ),
+        (
+            {"detector_version": "v1.1-2026-11", "rallies": [{"start": "x", "end": 4}]},
+            "ValueError: could not convert string to float: 'x'",
+        ),
+    ],
+)
+def test_a_bad_result_fails_the_job_and_keeps_the_old_files(
+    db: Session, engine: Engine, result: Any, error: str
+) -> None:
+    video_id = make_video(db)
+    published = trajectory.trajectory_path(video_id)
+    published.parent.mkdir(parents=True, exist_ok=True)
+    published.write_bytes(b"from the last run")
+
+    def processor(
+        _path: Path,
+        _corners: list[list[float]],
+        work_dir: Path,
+        _progress: ProgressFn,
+        _log: LogFn,
+    ) -> Any:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        (work_dir / trajectory.FILENAME).write_bytes(b"new run")
+        return result
+
+    assert run(engine, processor) is True
+    failed = fetch(engine, video_id)
+    assert (failed.status, failed.failure_reason) == ("failed", FailureReason.UNKNOWN)
+    assert failed.error == error
+    assert published.read_bytes() == b"from the last run"
+    assert rallies_of(engine, video_id) == []
+
+
+def test_failure_that_cannot_be_saved_is_retried_via_stale_requeue(
+    db: Session,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Even recording the failure fails (e.g. database gone): no exception escapes;
+    the job is left without a heartbeat, so it's re-queued once stale."""
+    video_id = make_video(db)
+
+    def fail_video(**_: Any) -> bool:
+        raise RuntimeError("database went away")
+
+    def processor(*_: Any) -> run_worker.Detection:
+        raise ValueError("detection failed")
+
+    caplog.set_level("INFO", logger="worker")
+    with monkeypatch.context() as m:
+        m.setattr(crud, "fail_video", fail_video)
+        assert run(engine, processor) is True
+    assert worker_lines(caplog)[-1].endswith(
+        "could not save the failure; the job goes back to the queue once its "
+        "heartbeat is stale"
+    )
+    stuck = fetch(engine, video_id)
+    assert (stuck.status, stuck.attempts) == ("processing", 1)
+
+    set_age(db, video_id, timedelta(minutes=10))  # heartbeat now stale
+    assert run(engine, lambda *_: detection({"start": 1.0, "end": 2.0})) is True
+    done = fetch(engine, video_id)
+    assert (done.status, done.attempts) == ("done", 2)
+
+
+def test_failure_of_a_job_lost_meanwhile_is_not_saved(
+    db: Session, engine: Engine, caplog: pytest.LogCaptureFixture
+) -> None:
+    video_id = make_video(db)
+    other_claim = uuid.uuid4()
+
+    def processor(*_: Any) -> run_worker.Detection:
+        with Session(engine) as session:
+            session.exec(
+                update(Video)
+                .where(col(Video.id) == video_id)
+                .values(claim_id=other_claim)
+            )
+            session.commit()
+        raise ValueError("detection failed")
+
+    caplog.set_level("INFO", logger="worker")
+    assert run(engine, processor) is True
+    now = fetch(engine, video_id)
+    assert (now.status, now.claim_id) == ("processing", other_claim)
+    assert worker_lines(caplog)[-1].endswith(
+        "lost: another worker has this job now; failure not saved"
+    )
+
+
+def test_loop_survives_an_error_outside_any_job(
+    db: Session,
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A bug in the loop itself (here: claiming raises once) is logged with its
+    traceback; the loop waits one poll and carries on."""
+    video_id = make_video(db)
+    real_claim = crud.claim_next_video
+    calls = 0
+
+    def claim_next_video(**kwargs: Any) -> Video | None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("bug while claiming")
+        return real_claim(**kwargs)
+
+    monkeypatch.setattr(crud, "claim_next_video", claim_next_video)
+    stop_when_idle(monkeypatch, idle_polls=2)  # 1st poll: after the error
+    caplog.set_level("INFO", logger="worker")
+    serve(engine, lambda *_: detection({"start": 1.0, "end": 2.0}))
+
+    assert fetch(engine, video_id).status == "done"
+    [error] = [r for r in caplog.records if "Unexpected error" in r.getMessage()]
+    assert error.exc_info is not None
+
+
+def test_once_stops_after_one_job(db: Session, engine: Engine) -> None:
+    first = make_video(db, age=timedelta(minutes=1))
+    second = make_video(db)
+    serve(engine, lambda *_: detection(), once=True)
+    assert fetch(engine, first).status == "done"
+    assert fetch(engine, second).status == "queued"
