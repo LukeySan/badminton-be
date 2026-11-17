@@ -142,6 +142,72 @@ def run_pipeline(
     return result
 
 
+def parse_detection(result: object) -> tuple[str, list[crud.DetectedRally]]:
+    """The pipeline's result -> (detector version, rallies), with a clear error if
+    it isn't a Detection.
+
+    Why the check: the worker imports `pipeline` once, but the code on disk can
+    change under a running worker (branch switch, pull). That happened: an old loop
+    (expecting a list of rallies) got v1.1's {detector_version, rallies} dict and
+    crashed with "string indices must be integers". Restart the worker after
+    changing the code; this turns the mix-up into a failed job, not a dead worker."""
+    if not (
+        isinstance(result, dict)
+        and isinstance(result.get("detector_version"), str)
+        and isinstance(result.get("rallies"), list)
+    ):
+        raise TypeError(
+            f"pipeline returned {type(result).__name__}, expected "
+            "{detector_version, rallies}: restart the worker after code changes"
+        )
+    rallies = [
+        crud.DetectedRally(
+            float(r["start"]),
+            float(r["end"]),
+            None if r.get("confidence") is None else float(r["confidence"]),
+            bool(r.get("is_maybe", False)),
+        )
+        for r in result["rallies"]
+    ]
+    return result["detector_version"], rallies
+
+
+def record_failure(
+    engine: Engine,
+    video_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    error: Exception,
+    log: JobLog,
+) -> None:
+    """Mark the job failed: a short reason for the user, the details internally.
+    Never raises: if even that can't be saved (database down), the job stays
+    'processing' without a heartbeat, so requeue_stale_videos picks it up again
+    after STALE_AFTER (and gives up after MAX_ATTEMPTS)."""
+    reason = failure_reason(error)
+    details = f"{type(error).__name__}: {error}"
+    if isinstance(error, PipelineError):
+        log.warning(f"failed: {reason} ({details})")
+    else:  # unexpected: a bug, so keep the traceback
+        log.exception(f"failed: {reason} ({details})")
+    try:
+        with Session(engine) as session:
+            ours = crud.fail_video(
+                session=session,
+                video_id=video_id,
+                claim_id=claim_id,
+                reason=reason,
+                error=details,
+            )
+    except Exception:
+        log.exception(
+            "could not save the failure; the job goes back to the queue once its "
+            "heartbeat is stale"
+        )
+        return
+    if not ours:
+        log.warning("lost: another worker has this job now; failure not saved")
+
+
 class Heartbeat(threading.Thread):
     """Writes progress + heartbeat every `interval` seconds until stopped.
 
@@ -242,12 +308,28 @@ def process_one(
     heartbeat = Heartbeat(engine, video_id, claim_id, heartbeat_seconds, log)
     heartbeat.start()
     started = time.monotonic()
+    # Everything after the claim is inside this try, not just the pipeline call:
+    # an error while reading the result or saving it must fail THIS job, not kill
+    # the worker (it did once: see parse_detection).
     try:
         if corners is None:
             raise ValueError("The video has no court corners")
         result = processor(
             video_path, corners, work_dir, heartbeat.on_progress, log.info
         )
+        heartbeat.stop()
+        # Checked before publishing, so a bad result keeps the old files
+        version, rallies = parse_detection(result)
+        publish_outputs(work_dir, video_id)
+        with Session(engine) as session:
+            saved = crud.finish_video(
+                session=session,
+                video_id=video_id,
+                claim_id=claim_id,
+                rallies=rallies,
+                detector_version=version,
+                source="rules" if version == "v1" else "model",
+            )
     except JobLost:
         heartbeat.stop()
         log.warning("lost: another worker has this job now; stopped")
@@ -260,45 +342,12 @@ def process_one(
         raise
     except Exception as e:
         heartbeat.stop()
-        reason = failure_reason(e)
-        details = f"{type(e).__name__}: {e}"
-        if isinstance(e, PipelineError):
-            log.warning(f"failed: {reason} ({details})")
-        else:  # unexpected: a bug, so keep the traceback
-            log.exception(f"failed: {reason} ({details})")
-        with Session(engine) as session:
-            crud.fail_video(
-                session=session,
-                video_id=video_id,
-                claim_id=claim_id,
-                reason=reason,
-                error=details,
-            )
+        record_failure(engine, video_id, claim_id, e, log)
         return True
-    heartbeat.stop()
 
-    publish_outputs(work_dir, video_id)
-    rallies, version = result["rallies"], result["detector_version"]
-    with Session(engine) as session:
-        saved = crud.finish_video(
-            session=session,
-            video_id=video_id,
-            claim_id=claim_id,
-            rallies=[
-                crud.DetectedRally(
-                    float(r["start"]),
-                    float(r["end"]),
-                    r.get("confidence"),
-                    bool(r.get("is_maybe", False)),
-                )
-                for r in rallies
-            ],
-            detector_version=version,
-            source="rules" if version == "v1" else "model",
-        )
     if saved:
-        play = sum(float(r["end"]) - float(r["start"]) for r in rallies)
-        maybes = sum(1 for r in rallies if r.get("is_maybe"))
+        play = sum(r.end - r.start for r in rallies)
+        maybes = sum(1 for r in rallies if r.is_maybe)
         log.info(
             f"done: {len(rallies)} rallies"
             + (f", {maybes} maybe" if maybes else "")
@@ -339,6 +388,9 @@ def main() -> None:
     from detector import DETECTORS, preload
 
     preload(detector)
+    # Import the whole pipeline now too, not on the first job: otherwise a worker
+    # started before a branch switch runs its old loop with the new pipeline.
+    import pipeline  # noqa: F401
 
     def processor(
         video_path: Path,
@@ -362,21 +414,50 @@ def main() -> None:
         worker_name,
         DETECTORS[detector],
     )
+    serve_forever(
+        processor,
+        worker_name,
+        once=args.once,
+        poll_seconds=args.poll,
+        stale_after=timedelta(seconds=args.stale_after),
+    )
+
+
+def serve_forever(
+    processor: Processor,
+    worker_name: str,
+    *,
+    once: bool = False,
+    poll_seconds: float = POLL_SECONDS,
+    stale_after: timedelta = STALE_AFTER,
+    engine: Engine = default_engine,
+    heartbeat_seconds: float = HEARTBEAT_SECONDS,
+) -> None:
+    """Process jobs until Ctrl+C (or one job with once=True). Nothing a job does
+    stops the loop; only Ctrl+C does."""
     try:
         while True:
             try:
                 did_work = process_one(
                     processor,
                     worker_name,
-                    stale_after=timedelta(seconds=args.stale_after),
+                    engine=engine,
+                    heartbeat_seconds=heartbeat_seconds,
+                    stale_after=stale_after,
                 )
             except OperationalError as e:
                 logger.error("Database unavailable (%s); retrying", e.orig)
                 did_work = False
-            if args.once and did_work:
+            except Exception:
+                # Last line of defence: process_one handles job errors itself, so
+                # this is a bug in the loop. Log it and keep serving the queue; a
+                # job it left 'processing' is re-queued once its heartbeat is stale.
+                logger.exception("Unexpected error in the worker loop; continuing")
+                did_work = False
+            if once and did_work:
                 break
             if not did_work:
-                time.sleep(args.poll)
+                time.sleep(poll_seconds)
     except KeyboardInterrupt:
         logger.info("Worker stopped")
 

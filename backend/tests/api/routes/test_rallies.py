@@ -631,3 +631,36 @@ def test_added_rallies_are_never_maybe(
     )
     added = r.json()["added"][0]
     assert (added["is_maybe"], added["confidence"]) == (False, None)
+
+
+def test_unconfirm_makes_it_a_maybe_again(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    """The app's undo of "Keep" (and of deleting a maybe: add it back, unconfirm)."""
+    h = normal_user_token_headers
+    b = video[1][1]
+    make_maybe(db, b)
+    client.post(url(video[0], f"/{b}/confirm"), headers=h)
+    r = client.delete(url(video[0], f"/{b}/confirm"), headers=h)
+    assert r.status_code == 200
+    change = r.json()
+    assert [(u["id"], u["is_maybe"]) for u in change["updated"]] == [(b, True)]
+    assert maybe_flags(change)[1] == (30.0, True, 0.5)
+    assert [c.action for c in corrections(db, video[0])] == ["confirm", "unconfirm"]
+
+    # Already a maybe: nothing to do, nothing logged
+    again = client.delete(url(video[0], f"/{b}/confirm"), headers=h)
+    assert again.json()["updated"] == []
+    assert len(corrections(db, video[0])) == 2
+
+    # A re-added rally (undo of deleting a maybe) can be made a maybe again
+    added = client.post(url(video[0]), headers=h, json={"start": 21, "end": 25})
+    new_id = added.json()["added"][0]["id"]
+    r = client.delete(url(video[0], f"/{new_id}/confirm"), headers=h)
+    assert r.json()["updated"][0]["is_maybe"] is True
+
+    missing = client.delete(url(video[0], "/999999/confirm"), headers=h)
+    assert missing.status_code == 404

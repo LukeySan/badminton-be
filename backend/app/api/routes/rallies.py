@@ -115,6 +115,23 @@ def confirm_rally(
     )
 
 
+@router.delete("/{rally_id}/confirm", response_model=RallyChange, responses=REFUSALS)
+def unconfirm_rally(
+    session: SessionDep, current_user: CurrentUser, id: uuid.UUID, rally_id: int
+) -> Any:
+    """
+    Undo a confirm: the rally is shown as a "maybe" again (`is_maybe` true). The
+    app uses it to undo "Keep", and after re-adding a deleted maybe (undo of the
+    delete). Logged as a correction. No-op for a rally that is already a maybe.
+    """
+    get_video_for_user(session, current_user, id)
+    return run(
+        lambda: crud.unconfirm_rally(
+            session=session, video_id=id, user_id=current_user.id, rally_id=rally_id
+        )
+    )
+
+
 @router.post("/{rally_id}/split", response_model=RallyChange, responses=REFUSALS)
 def split_rally(
     session: SessionDep,

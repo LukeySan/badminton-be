@@ -836,6 +836,21 @@ def confirm_rally(
     return c.finish(updated=[rally])
 
 
+def unconfirm_rally(
+    *, session: Session, video_id: uuid.UUID, user_id: uuid.UUID, rally_id: int
+) -> RallyChange:
+    """Take back a "yes": the rally is a "maybe" again (the app's undo of confirming
+    a maybe, or of deleting one). Logged too, so the later answer wins."""
+    c = _Correction(session, video_id, user_id)
+    rally = c.get(rally_id)
+    if rally.is_maybe:
+        return c.finish()
+    rally.is_maybe = True
+    session.add(rally)
+    c.log("unconfirm", rally, rally, _detected(rally))
+    return c.finish(updated=[rally])
+
+
 def delete_rally(
     *, session: Session, video_id: uuid.UUID, user_id: uuid.UUID, rally_id: int
 ) -> RallyChange:

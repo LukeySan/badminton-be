@@ -108,6 +108,7 @@ def test_set_analysis_with_maybe_rallies_and_a_detector_version(
     )
     assert r.status_code == 200
     assert r.json()["detector_version"] == "v1.1-2026-11"
+    assert r.json()["detector_outdated"] is False
     rallies = client.get(
         f"{settings.API_V1_STR}/videos/{video.id}/rallies",
         headers=superuser_token_headers,
