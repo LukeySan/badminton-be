@@ -1,4 +1,5 @@
-"""app/reel_ops.py: adjusting reel clips to changed rallies (no database)."""
+"""app/reel_ops.py: adjusting reel clips to changed rallies, and which hidden
+footage restored anchors bring back (no database)."""
 
 from collections.abc import Sequence
 from typing import Any
@@ -6,7 +7,17 @@ from typing import Any
 import pytest
 
 from app.models import ReelClip, ReelEdit
-from app.reel_ops import Target, best_overlap, retarget_edit
+from app.reel_ops import (
+    Target,
+    best_overlap,
+    clip_cuts,
+    hidden_regions,
+    live_anchors,
+    normalize_edit,
+    restored_regions,
+    retarget_edit,
+    stretches,
+)
 
 A, B, C = 1, 2, 3  # rally ids
 
@@ -150,3 +161,156 @@ def test_best_overlap(pieces: list[tuple[float, float]], expected: int | None) -
     clip = edit((99, pieces)).clips[0]
     result = best_overlap(clip, rallies)
     assert [t.rally_id for t in result] == ([expected] if expected else [])
+
+
+# --- restored breaks ---------------------------------------------------------------
+
+
+def with_anchors(e: ReelEdit, *anchors: float) -> ReelEdit:
+    return e.model_copy(update={"restored_anchors": list(anchors)})
+
+
+def test_hidden_regions_are_what_no_piece_covers() -> None:
+    e = edit((A, [(9, 14), (16, 21)]), (B, [(29, 41)]))
+    assert hidden_regions(e, 60) == [(0, 9), (14, 16), (21, 29), (41, 60)]
+    # Pieces touching the video's ends leave no stretch there
+    e = edit((A, [(0, 21)]), (B, [(29, 60.05)]))
+    assert hidden_regions(e, 60) == [(21, 29)]
+
+
+def test_overlapping_pieces_count_as_one() -> None:
+    """A replay repeats footage another piece already covers."""
+    e = edit((A, [(9, 21)]), (B, [(29, 41)]), (A, [(15, 18)]), (A, [(20, 24)]))
+    assert hidden_regions(e, 50) == [(0, 9), (24, 29), (41, 50)]
+
+
+def test_slivers_are_no_stretch() -> None:
+    e = edit((A, [(0.04, 21)]), (B, [(21.03, 59.98)]))
+    assert hidden_regions(e, 60) == []
+
+
+def test_no_duration_means_an_open_ended_last_stretch() -> None:
+    e = edit((A, [(9, 21)]))
+    assert hidden_regions(e, None) == [(0, 9), (21, float("inf"))]
+
+
+def test_a_stretch_is_restored_by_an_anchor_strictly_inside() -> None:
+    e = edit((A, [(9, 21)]), (B, [(29, 41)]))
+    assert restored_regions(with_anchors(e, 25), 60) == [(21, 29)]
+    # On a piece's edge, or inside a piece: nothing
+    assert restored_regions(with_anchors(e, 21, 29, 15), 60) == []
+
+
+def test_restored_stretch_follows_its_pieces() -> None:
+    """The point of anchors: a rally fix or lead change moves the pieces, and the
+    restored break between them moves too."""
+    before = with_anchors(edit((A, [(9, 21)]), (B, [(29, 41)])), 25)
+    after = with_anchors(edit((A, [(9.5, 20.5)]), (B, [(29.5, 40.5)]), lead=0.5), 25)
+    assert restored_regions(before, 60) == [(21, 29)]
+    assert restored_regions(after, 60) == [(20.5, 29.5)]
+
+
+def test_live_anchors_one_per_break_dead_ones_dropped() -> None:
+    e = edit((A, [(9, 21)]), (B, [(29, 41)]))
+    anchors = with_anchors(e, 26.5, 15, 23.5, 70, 21, 3)
+    assert live_anchors(anchors, 60) == [3, 23.5]
+
+
+def test_normalize_drops_empty_clips_and_dead_anchors() -> None:
+    e = ReelEdit.model_validate(
+        {
+            "clips": [
+                {"rally_id": A, "pieces": [{"start": 9, "end": 21}]},
+                {"rally_id": B, "pieces": []},
+            ],
+            "restored_anchors": [15, 25, 26],
+        }
+    )
+    normal = normalize_edit(e, 60)
+    assert [c.rally_id for c in normal.clips] == [A]
+    assert normal.restored_anchors == [25]
+
+
+# --- cuts: deleted footage ------------------------------------------------------------
+
+
+def cut_edit(
+    *clips: tuple[int, Sequence[tuple[float, float]], Sequence[tuple[float, float]]],
+    anchors: Sequence[float] = (),
+) -> ReelEdit:
+    return ReelEdit.model_validate(
+        {
+            "clips": [
+                {
+                    "rally_id": r,
+                    "pieces": [{"start": s, "end": e} for s, e in pieces],
+                    "cuts": [{"start": s, "end": e} for s, e in cuts],
+                }
+                for r, pieces, cuts in clips
+            ],
+            "restored_anchors": list(anchors),
+        }
+    )
+
+
+def cuts(e: ReelEdit) -> list[list[tuple[float, float]]]:
+    return [[(c.start, c.end) for c in clip.cuts] for clip in e.clips]
+
+
+def test_cuts_are_walls_between_stretches() -> None:
+    """Rally 2's deleted lead 26-29: the hidden 21-29 is split into the stretch
+    21-26 and the cut, so a restored break stops at the cut."""
+    e = cut_edit((A, [(9, 21)], []), (B, [(29, 41)], [(26, 29)]), anchors=[25])
+    assert hidden_regions(e, 60) == [(0, 9), (21, 29), (41, 60)]  # cuts are hidden
+    assert stretches(e, 60) == [(0, 9), (21, 26), (41, 60)]
+    assert restored_regions(e, 60) == [(21, 26)]
+
+
+def test_an_anchor_in_a_cut_restores_nothing() -> None:
+    e = cut_edit((A, [(9, 13), (16, 21)], [(13, 16)]), anchors=[14.5])
+    assert restored_regions(e, 60) == []
+    assert live_anchors(e, 60) == []
+
+
+def test_a_cut_another_clip_shows_is_no_wall() -> None:
+    """A replay's piece covers part of rally 1's deleted tail: that part plays (in
+    the replay), the rest is still a cut."""
+    e = cut_edit((A, [(9, 18)], [(18, 21)]), (A, [(17, 19)], []))
+    assert clip_cuts(e, 60) == [(0, (19, 21))]
+
+
+def test_normalize_tidies_cuts() -> None:
+    """Sorted, merged, minus the clip's own pieces, slivers dropped; a clip without
+    pieces goes with its cuts."""
+    e = cut_edit(
+        (A, [(9, 14)], [(18, 21), (12, 16), (16, 18), (20.98, 21.02)]),
+        (B, [], [(29, 30)]),
+    )
+    assert cuts(normalize_edit(e, 60)) == [[(14, 21.02)]]
+
+
+def test_rally_fix_trims_cuts_like_pieces() -> None:
+    e = cut_edit((A, [(10, 18)], [(9, 10), (18, 21)]))
+    new, impact = retarget_edit(e, only(A, [Target(A, 12, 19)]))  # 11-20 now
+    assert cuts(new) == [[(18, 20)]]  # the lead cut 9-10 is outside 11-20 now
+    assert spans(new) == [(A, [(11, 18)])]
+    assert impact.pieces_trimmed == 1  # cuts aren't counted: nothing of them plays
+
+
+def test_split_hands_cuts_to_the_part_they_are_in() -> None:
+    e = cut_edit((A, [(9, 12), (14, 21)], [(12, 14)]))
+    new, _ = retarget_edit(e, only(A, [Target(A, 10, 13), Target(C, 15, 20)]))
+    assert spans(new) == [(A, [(9, 12)]), (C, [(14, 21)])]
+    assert cuts(new) == [[(12, 14)], []]
+
+
+def test_merge_joins_cuts_and_delete_drops_them() -> None:
+    e = cut_edit((A, [(9, 18)], [(18, 21)]), (B, [(32, 41)], [(29, 32)]))
+    merged, _ = retarget_edit(
+        e,
+        lambda clip: [Target(C, 10, 40)] if clip.rally_id in (A, B) else None,
+        join=(A, B),
+    )
+    assert cuts(merged) == [[(18, 21), (29, 32)]]
+    deleted, _ = retarget_edit(e, only(A, []))
+    assert cuts(deleted) == [[(29, 32)]]

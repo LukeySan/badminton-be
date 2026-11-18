@@ -3,16 +3,22 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal, NamedTuple
 
-from sqlalchemy import extract, update
+from sqlalchemy import and_, extract, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlmodel import Session, col, delete, func, select
 
+from app.core.config import settings
 from app.core.security import get_password_hash, verify_password
 from app.models import (
+    EXPORT_SIZES,
     MIN_RALLY_SECONDS,
     TRIM_TOLERANCE,
     Correction,
     CorrectionAction,
+    Export,
+    ExportFailureReason,
+    ExportPublic,
+    ExportSnapshot,
     FailureReason,
     Rally,
     RallyChange,
@@ -25,9 +31,16 @@ from app.models import (
     UserUpdate,
     Video,
     VideoPublic,
+    export_filename,
     get_datetime_utc,
 )
-from app.reel_ops import Retarget, Target, best_overlap, retarget_edit
+from app.reel_ops import (
+    Retarget,
+    Target,
+    best_overlap,
+    normalize_edit,
+    retarget_edit,
+)
 
 
 def create_user(*, session: Session, user_create: UserCreate) -> User:
@@ -252,37 +265,55 @@ def get_video_public(*, session: Session, video: Video) -> VideoPublic:
 MAX_ATTEMPTS = 3
 MAX_ERROR_LENGTH = 2000
 
+# Two kinds of jobs share this machinery: videos (rally analysis) and exports (reel
+# renders). Same columns (status, progress, claim_id, claimed_by, attempts,
+# updated_at, failure_reason, error), so one generic implementation each; exports
+# also have a soft delete, and a deleted export is no longer a job.
 
-def _claimed(video_id: uuid.UUID, claim_id: uuid.UUID) -> tuple[Any, ...]:
+
+def _live_job[J: (Video, Export)](model: type[J]) -> tuple[Any, ...]:
+    return (col(Export.deleted_at).is_(None),) if model is Export else ()
+
+
+def _claimed_job[J: (Video, Export)](
+    model: type[J], job_id: uuid.UUID, claim_id: uuid.UUID
+) -> tuple[Any, ...]:
     """WHERE clause for "this worker still owns this job"."""
     return (
-        col(Video.id) == video_id,
-        col(Video.status) == "processing",
-        col(Video.claim_id) == claim_id,
+        col(model.id) == job_id,
+        col(model.status) == "processing",
+        col(model.claim_id) == claim_id,
+        *_live_job(model),
     )
 
 
-def claim_next_video(*, session: Session, claimed_by: str) -> Video | None:
-    """Take the oldest queued video and mark it processing, or return None.
+def _claimed(video_id: uuid.UUID, claim_id: uuid.UUID) -> tuple[Any, ...]:
+    return _claimed_job(Video, video_id, claim_id)
+
+
+def _claim_next[J: (Video, Export)](
+    session: Session, model: type[J], claimed_by: str
+) -> J | None:
+    """Take the oldest queued job and mark it processing, or return None.
 
     FOR UPDATE locks the selected row until commit; SKIP LOCKED makes another
-    worker claiming at the same moment skip that row and take the next video,
+    worker claiming at the same moment skip that row and take the next job,
     instead of waiting for the lock and then finding nothing.
     """
-    video_id = session.exec(
-        select(Video.id)
-        .where(col(Video.status) == "queued")
-        # updated_at = when it was queued: nothing else changes a queued video
-        .order_by(col(Video.updated_at), col(Video.created_at))
+    job_id = session.exec(
+        select(model.id)
+        .where(col(model.status) == "queued", *_live_job(model))
+        # updated_at = when it was queued: nothing else changes a queued job
+        .order_by(col(model.updated_at), col(model.created_at))
         .limit(1)
         .with_for_update(skip_locked=True)
     ).first()
-    if video_id is None:
+    if job_id is None:
         session.rollback()  # end the transaction
         return None
     session.exec(
-        update(Video)
-        .where(col(Video.id) == video_id)
+        update(model)
+        .where(col(model.id) == job_id)
         .values(
             status="processing",
             progress=0.0,
@@ -290,25 +321,116 @@ def claim_next_video(*, session: Session, claimed_by: str) -> Video | None:
             error=None,
             claim_id=uuid.uuid4(),
             claimed_by=claimed_by[:255],
-            attempts=col(Video.attempts) + 1,
+            attempts=col(model.attempts) + 1,
             updated_at=func.now(),
         )
     )
     session.commit()
-    return session.get(Video, video_id)
+    return session.get(model, job_id)
+
+
+def _heartbeat[J: (Video, Export)](
+    session: Session,
+    model: type[J],
+    job_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    progress: float,
+) -> bool:
+    result = session.exec(
+        update(model)
+        .where(*_claimed_job(model, job_id, claim_id))
+        .values(progress=min(max(progress, 0.0), 1.0), updated_at=func.now())
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+def _fail[J: (Video, Export)](
+    session: Session,
+    model: type[J],
+    job_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    reason: str,
+    error: str,
+) -> bool:
+    result = session.exec(
+        update(model)
+        .where(*_claimed_job(model, job_id, claim_id))
+        .values(
+            status="failed",
+            failure_reason=reason,
+            error=error[:MAX_ERROR_LENGTH],
+            claim_id=None,
+            updated_at=func.now(),
+        )
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+def _release[J: (Video, Export)](
+    session: Session, model: type[J], job_id: uuid.UUID, claim_id: uuid.UUID
+) -> bool:
+    result = session.exec(
+        update(model)
+        .where(*_claimed_job(model, job_id, claim_id))
+        .values(
+            status="queued",
+            progress=0.0,
+            claim_id=None,
+            attempts=col(model.attempts) - 1,
+            updated_at=func.now(),
+        )
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+def _requeue_stale[J: (Video, Export)](
+    session: Session,
+    model: type[J],
+    stale_after: timedelta,
+    max_attempts: int,
+    gave_up_reason: str,
+) -> tuple[int, int]:
+    stale = (
+        col(model.status) == "processing",
+        col(model.updated_at) < func.now() - stale_after,
+        *_live_job(model),
+    )
+    failed = session.exec(
+        update(model)
+        .where(*stale, col(model.attempts) >= max_attempts)
+        .values(
+            status="failed",
+            failure_reason=gave_up_reason,
+            error=(
+                f"Processing stopped responding {max_attempts} times "
+                "(the worker crashed or lost its connection)."
+            ),
+            claim_id=None,
+            updated_at=func.now(),
+        )
+    )
+    requeued = session.exec(
+        update(model)
+        .where(*stale, col(model.attempts) < max_attempts)
+        .values(status="queued", progress=0.0, claim_id=None, updated_at=func.now())
+    )
+    session.commit()
+    return requeued.rowcount, failed.rowcount
+
+
+def claim_next_video(*, session: Session, claimed_by: str) -> Video | None:
+    """Take the oldest queued video and mark it processing, or return None."""
+    return _claim_next(session, Video, claimed_by)
 
 
 def heartbeat_video(
     *, session: Session, video_id: uuid.UUID, claim_id: uuid.UUID, progress: float
 ) -> bool:
     """Refresh the heartbeat and progress. False = the job is no longer ours."""
-    result = session.exec(
-        update(Video)
-        .where(*_claimed(video_id, claim_id))
-        .values(progress=min(max(progress, 0.0), 1.0), updated_at=func.now())
-    )
-    session.commit()
-    return result.rowcount == 1
+    return _heartbeat(session, Video, video_id, claim_id, progress)
 
 
 class DetectedRally(NamedTuple):
@@ -412,19 +534,7 @@ def fail_video(
 ) -> bool:
     """Mark the video failed: `reason` is shown to the user, `error` (technical
     details) stays internal. False = no longer ours."""
-    result = session.exec(
-        update(Video)
-        .where(*_claimed(video_id, claim_id))
-        .values(
-            status="failed",
-            failure_reason=reason,
-            error=error[:MAX_ERROR_LENGTH],
-            claim_id=None,
-            updated_at=func.now(),
-        )
-    )
-    session.commit()
-    return result.rowcount == 1
+    return _fail(session, Video, video_id, claim_id, reason, error)
 
 
 def release_video(
@@ -432,19 +542,7 @@ def release_video(
 ) -> bool:
     """Put a job back in the queue, e.g. when the worker is stopped with Ctrl+C.
     Doesn't count as an attempt."""
-    result = session.exec(
-        update(Video)
-        .where(*_claimed(video_id, claim_id))
-        .values(
-            status="queued",
-            progress=0.0,
-            claim_id=None,
-            attempts=col(Video.attempts) - 1,
-            updated_at=func.now(),
-        )
-    )
-    session.commit()
-    return result.rowcount == 1
+    return _release(session, Video, video_id, claim_id)
 
 
 def requeue_stale_videos(
@@ -454,31 +552,9 @@ def requeue_stale_videos(
     connection, machine went to sleep). Re-queues them, or fails them once they have
     used up max_attempts, so a video that crashes the worker every time doesn't
     loop forever. Returns (requeued, failed)."""
-    stale = (
-        col(Video.status) == "processing",
-        col(Video.updated_at) < func.now() - stale_after,
+    return _requeue_stale(
+        session, Video, stale_after, max_attempts, FailureReason.KEPT_STOPPING
     )
-    failed = session.exec(
-        update(Video)
-        .where(*stale, col(Video.attempts) >= max_attempts)
-        .values(
-            status="failed",
-            failure_reason=FailureReason.KEPT_STOPPING,
-            error=(
-                f"Processing stopped responding {max_attempts} times "
-                "(the worker crashed or lost its connection)."
-            ),
-            claim_id=None,
-            updated_at=func.now(),
-        )
-    )
-    requeued = session.exec(
-        update(Video)
-        .where(*stale, col(Video.attempts) < max_attempts)
-        .values(status="queued", progress=0.0, claim_id=None, updated_at=func.now())
-    )
-    session.commit()
-    return requeued.rowcount, failed.rowcount
 
 
 def queue_stats(*, session: Session) -> tuple[int, int, float | None]:
@@ -554,7 +630,7 @@ def create_reel(
             video_id=video.id,
             owner_id=video.owner_id,
             title=title,
-            edit=edit.without_empty_clips().model_dump(mode="json"),
+            edit=normalize_edit(edit, video.duration).model_dump(mode="json"),
             created_at=now,
             updated_at=now,
         )
@@ -597,6 +673,7 @@ def save_video_reel(
         title=title,
         edit=edit,
         expected_updated_at=expected_updated_at,
+        duration=video.duration,
     ):
         return None, False
     session.refresh(reel)
@@ -615,17 +692,19 @@ def update_reel(
     title: str,
     edit: ReelEdit,
     expected_updated_at: datetime,
+    duration: float | None = None,
 ) -> bool:
     """Replace the title and edit list, only if the reel is unchanged since the
     caller loaded it (updated_at still matches; optimistic locking). One
     conditional UPDATE, so two saves at once can't both pass the check.
-    False = changed since, or deleted."""
+    duration: the video's, to tell which restored anchors are still live
+    (normalize_edit). False = changed since, or deleted."""
     result = session.exec(
         update(Reel)
         .where(*_live_reel(reel_id), col(Reel.updated_at) == expected_updated_at)
         .values(
             title=title,
-            edit=edit.without_empty_clips().model_dump(mode="json"),
+            edit=normalize_edit(edit, duration).model_dump(mode="json"),
             updated_at=get_datetime_utc(),
         )
     )
@@ -951,3 +1030,240 @@ def merge_rallies(
         retarget=lambda clip: [target] if clip.rally_id in old_ids else None,
         join=(first.id, second.id),
     )
+
+
+# --- Exports --------------------------------------------------------------------
+# A queued export is a job like a video (claimed with the generic functions above).
+# Soft delete: deleted_at hides it from the API; a worker rendering it notices on
+# its next heartbeat (the claim no longer matches) and stops.
+
+CreateExportResult = Literal["created", "already_active", "limit_reached"]
+_ACTIVE_EXPORT = (
+    col(Export.status).in_(ACTIVE_STATUSES),
+    col(Export.deleted_at).is_(None),
+)
+
+
+def create_export(
+    *,
+    session: Session,
+    video: Video,
+    reel: Reel,
+    snapshot: ExportSnapshot,
+    quality: str,
+    max_active: int,
+) -> tuple[Export | None, CreateExportResult]:
+    """Queue an export of the reel, unless one of it is already queued/processing,
+    or the owner already has max_active exports queued/processing.
+
+    Race-safe like queue_video and create_reel: the owner's user row is locked while
+    counting, and the insert is ON CONFLICT DO NOTHING on the partial unique index
+    "one active export per reel", so two clicks queue exactly one."""
+    session.exec(
+        select(User.id).where(col(User.id) == video.owner_id).with_for_update()
+    ).one()
+    active_for_reel = session.exec(
+        select(Export.id).where(col(Export.reel_id) == reel.id, *_ACTIVE_EXPORT)
+    ).first()
+    if active_for_reel is not None:
+        session.rollback()  # "already exporting" is the more useful answer
+        return None, "already_active"
+    active = session.exec(
+        select(func.count())
+        .select_from(Export)
+        .where(col(Export.owner_id) == video.owner_id, *_ACTIVE_EXPORT)
+    ).one()
+    if active >= max_active:
+        session.rollback()
+        return None, "limit_reached"
+    now = get_datetime_utc()
+    export_id = session.exec(
+        pg_insert(Export)
+        .values(
+            id=uuid.uuid4(),
+            video_id=video.id,
+            reel_id=reel.id,
+            owner_id=video.owner_id,
+            title=reel.title,
+            status="queued",
+            progress=0.0,
+            format=snapshot.format,
+            quality=quality,
+            snapshot=snapshot.model_dump(mode="json"),
+            attempts=0,
+            created_at=now,
+            updated_at=now,
+        )
+        .on_conflict_do_nothing(
+            index_elements=[col(Export.reel_id)],
+            index_where=and_(*_ACTIVE_EXPORT),
+        )
+        .returning(col(Export.id))
+    ).first()
+    session.commit()
+    if export_id is None:
+        return None, "already_active"  # queued by another request a moment ago
+    export = session.get(Export, export_id[0])
+    assert export is not None
+    return export, "created"
+
+
+def export_public(export: Export) -> ExportPublic:
+    width, height = EXPORT_SIZES[(export.format, export.quality)]
+    snapshot = ExportSnapshot.model_validate(export.snapshot)
+    return ExportPublic.model_validate(
+        export,
+        update={
+            "width": width,
+            "height": height,
+            "duration": export.duration
+            if export.duration is not None
+            else snapshot.duration,
+            "filename": export_filename(export.title),
+            "expires_at": export_expires_at(export),
+        },
+    )
+
+
+def export_expires_at(export: Export) -> datetime:
+    return export.created_at + timedelta(days=settings.EXPORT_RETENTION_DAYS)
+
+
+def get_export(*, session: Session, export_id: uuid.UUID) -> Export | None:
+    """The export, or None if it doesn't exist or was deleted."""
+    return session.exec(
+        select(Export).where(
+            col(Export.id) == export_id, col(Export.deleted_at).is_(None)
+        )
+    ).first()
+
+
+def list_video_exports(
+    *, session: Session, video_id: uuid.UUID
+) -> tuple[Sequence[Export], int]:
+    """A video's exports (not deleted), newest first. All of its reels' exports: a
+    finished file stays downloadable even if the reel was deleted and made again."""
+    live = (col(Export.video_id) == video_id, col(Export.deleted_at).is_(None))
+    exports = session.exec(
+        select(Export).where(*live).order_by(col(Export.created_at).desc())
+    ).all()
+    return exports, len(exports)
+
+
+def soft_delete_export(*, session: Session, export_id: uuid.UUID) -> str | None:
+    """Mark the export deleted. Returns its file's path (relative to STORAGE_DIR)
+    for the caller to remove after the commit, "" if it has no file, None if it
+    didn't exist or was already deleted. The row is locked first (an UPDATE's
+    RETURNING would give the path after clearing it)."""
+    row = session.exec(
+        select(Export.id, Export.output_path)
+        .where(col(Export.id) == export_id, col(Export.deleted_at).is_(None))
+        .with_for_update()
+    ).first()
+    if row is None:
+        session.rollback()
+        return None
+    session.exec(
+        update(Export)
+        .where(col(Export.id) == export_id)
+        .values(deleted_at=get_datetime_utc(), output_path=None)
+    )
+    session.commit()
+    return row[1] or ""
+
+
+def claim_next_export(*, session: Session, claimed_by: str) -> Export | None:
+    """Take the oldest queued export (not deleted) and mark it processing."""
+    return _claim_next(session, Export, claimed_by)
+
+
+def heartbeat_export(
+    *, session: Session, export_id: uuid.UUID, claim_id: uuid.UUID, progress: float
+) -> bool:
+    """False = no longer ours (re-queued as stale, deleted, or its video deleted)."""
+    return _heartbeat(session, Export, export_id, claim_id, progress)
+
+
+def finish_export(
+    *,
+    session: Session,
+    export_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    output_path: str,
+    size_bytes: int,
+    duration: float,
+) -> bool:
+    """Mark the export done with its file. False = no longer ours (the caller then
+    removes the file)."""
+    result = session.exec(
+        update(Export)
+        .where(*_claimed_job(Export, export_id, claim_id))
+        .values(
+            status="done",
+            progress=1.0,
+            output_path=output_path,
+            size_bytes=size_bytes,
+            duration=duration,
+            claim_id=None,
+            updated_at=func.now(),
+        )
+    )
+    session.commit()
+    return result.rowcount == 1
+
+
+def fail_export(
+    *,
+    session: Session,
+    export_id: uuid.UUID,
+    claim_id: uuid.UUID,
+    reason: ExportFailureReason,
+    error: str,
+) -> bool:
+    return _fail(session, Export, export_id, claim_id, reason, error)
+
+
+def release_export(
+    *, session: Session, export_id: uuid.UUID, claim_id: uuid.UUID
+) -> bool:
+    return _release(session, Export, export_id, claim_id)
+
+
+def requeue_stale_exports(
+    *, session: Session, stale_after: timedelta, max_attempts: int = MAX_ATTEMPTS
+) -> tuple[int, int]:
+    return _requeue_stale(
+        session, Export, stale_after, max_attempts, ExportFailureReason.KEPT_STOPPING
+    )
+
+
+def purge_exports(*, session: Session, older_than: timedelta) -> tuple[int, list[str]]:
+    """Soft-delete exports requested more than `older_than` ago (except ones being
+    rendered right now), and collect the files of all deleted exports that still
+    have one. Returns (exports deleted now, files to remove). The paths are cleared
+    in the same transaction, so a second run finds nothing left to do; remove the
+    files after this returns (a crash in between leaves orphan files, never a row
+    pointing at a missing file)."""
+    expired = session.exec(
+        update(Export)
+        .where(
+            col(Export.deleted_at).is_(None),
+            col(Export.status) != "processing",
+            col(Export.created_at) < func.now() - older_than,
+        )
+        .values(deleted_at=func.now())
+    ).rowcount
+    with_files = session.exec(
+        select(Export.id, Export.output_path)
+        .where(
+            col(Export.deleted_at).is_not(None), col(Export.output_path).is_not(None)
+        )
+        .with_for_update()
+    ).all()
+    session.exec(
+        update(Export)
+        .where(col(Export.id).in_([export_id for export_id, _ in with_files]))
+        .values(output_path=None)
+    )
+    session.commit()
+    return expired, [path for _, path in with_files if path]

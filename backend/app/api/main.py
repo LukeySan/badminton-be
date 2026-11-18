@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.routes import (
+    exports,
     health,
     login,
     private,
@@ -20,6 +21,7 @@ api_router.include_router(utils.router)
 api_router.include_router(videos.router)
 api_router.include_router(rallies.router)
 api_router.include_router(reels.router)
+api_router.include_router(exports.router)
 
 
 if settings.FASTAPI_ENV == "development":

@@ -1,0 +1,83 @@
+{
+  "description": "A restored stretch that contains a rally not in the reel: all of it plays, as one stretch.",
+  "duration": 70,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 30,
+      "end": 40
+    },
+    {
+      "id": 3,
+      "start": 50,
+      "end": 60
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      35
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 21,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 3,
+        "pieces": [
+          {
+            "start": 49,
+            "end": 61,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 21,
+        "slow_mo": false
+      },
+      {
+        "kind": "gap",
+        "start": 21,
+        "end": 49,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 49,
+        "end": 61,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 52
+  }
+}

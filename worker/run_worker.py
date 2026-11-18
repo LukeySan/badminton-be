@@ -1,6 +1,10 @@
 """
-Worker loop: takes queued videos from the database and finds their rallies.
+Worker loop: takes queued jobs from the database: reel exports (rendered with
+ffmpeg, worker/reel_export.py) first, because they are short, then videos (rally
+analysis). On macOS, put FriBiDi on the library path first (Thai captions need it,
+see worker/caption_image.py; the worker won't start without it):
 
+    export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
     uv run --package worker python worker/run_worker.py               # run until Ctrl+C
     uv run --package worker python worker/run_worker.py --once        # one job, then exit
     uv run --package worker python worker/run_worker.py --batch-size 16   # NVIDIA GPU
@@ -23,8 +27,9 @@ import time
 import uuid
 from collections.abc import Callable
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 from sqlalchemy import Engine
 from sqlalchemy.exc import OperationalError
@@ -33,12 +38,19 @@ from sqlmodel import Session
 from app import crud, thumbnails, trajectory
 from app.core.config import settings
 from app.core.db import engine as default_engine
-from app.models import FailureReason
+from app.models import EXPORT_SIZES, ExportFailureReason, FailureReason, Video
 
 WORKER_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORKER_DIR))  # for `import pipeline`, `import job_errors`
 
-from job_errors import CourtNotVisible, PipelineError, VideoUnreadable  # noqa: E402
+import caption_image  # noqa: E402
+import reel_export  # noqa: E402
+from job_errors import (  # noqa: E402
+    CourtNotVisible,
+    PipelineError,
+    SourceUnreadable,
+    VideoUnreadable,
+)
 from thumbnail_strip import replace_dir  # noqa: E402
 from trajectory_file import FILENAME as TRAJECTORY_FILENAME  # noqa: E402
 
@@ -76,6 +88,54 @@ def failure_reason(e: Exception) -> FailureReason:
         if isinstance(e, error_type):
             return reason
     return FailureReason.UNKNOWN
+
+
+def export_failure_reason(e: Exception) -> ExportFailureReason:
+    if isinstance(e, SourceUnreadable):
+        return ExportFailureReason.SOURCE_UNREADABLE
+    return ExportFailureReason.UNKNOWN
+
+
+class ExportJob(NamedTuple):
+    """A claimed export: what run_export needs, read before the session closes."""
+
+    id: uuid.UUID
+    video_id: uuid.UUID
+    claim_id: uuid.UUID
+    title: str
+    format: str
+    quality: str
+    snapshot: dict[str, Any]
+    source: Path  # the original upload
+    attempts: int
+
+
+# (original, snapshot, width, height, output file, on_progress(0-1), log(line))
+#   -> {duration, size_bytes}
+ExportRenderer = Callable[
+    [Path, dict[str, Any], int, int, Path, Callable[[float], None],
+     Callable[[str], None]],
+    reel_export.RenderResult,
+]  # fmt: skip
+
+
+def render_export(
+    source: Path,
+    snapshot: dict[str, Any],
+    width: int,
+    height: int,
+    out_path: Path,
+    on_progress: Callable[[float], None],
+    log: Callable[[str], None],
+) -> reel_export.RenderResult:
+    return reel_export.render_export(
+        str(source), snapshot, width, height, str(out_path), on_progress, log
+    )
+
+
+def export_output_path(video_id: uuid.UUID, export_id: uuid.UUID) -> str:
+    """Relative to STORAGE_DIR: next to the video, so deleting it removes them."""
+    return f"{video_id}/exports/{export_id}.mp4"
 
 
 def fmt_duration(seconds: float) -> str:
@@ -174,16 +234,16 @@ def parse_detection(result: object) -> tuple[str, list[crud.DetectedRally]]:
 
 def record_failure(
     engine: Engine,
-    video_id: uuid.UUID,
-    claim_id: uuid.UUID,
     error: Exception,
     log: JobLog,
+    reason: StrEnum,
+    save: Callable[[Session, str], bool],
 ) -> None:
-    """Mark the job failed: a short reason for the user, the details internally.
-    Never raises: if even that can't be saved (database down), the job stays
-    'processing' without a heartbeat, so requeue_stale_videos picks it up again
-    after STALE_AFTER (and gives up after MAX_ATTEMPTS)."""
-    reason = failure_reason(error)
+    """Mark the job failed: a short reason for the user (`reason`), the details
+    internally; save(session, details) writes both and returns False if the job is
+    no longer ours. Never raises: if even that can't be saved (database down), the
+    job stays 'processing' without a heartbeat, so the stale re-queue picks it up
+    again after STALE_AFTER (and gives up after MAX_ATTEMPTS)."""
     details = f"{type(error).__name__}: {error}"
     if isinstance(error, PipelineError):
         log.warning(f"failed: {reason} ({details})")
@@ -191,13 +251,7 @@ def record_failure(
         log.exception(f"failed: {reason} ({details})")
     try:
         with Session(engine) as session:
-            ours = crud.fail_video(
-                session=session,
-                video_id=video_id,
-                claim_id=claim_id,
-                reason=reason,
-                error=details,
-            )
+            ours = save(session, details)
     except Exception:
         log.exception(
             "could not save the failure; the job goes back to the queue once its "
@@ -213,46 +267,45 @@ class Heartbeat(threading.Thread):
 
     A thread, not just the progress callback: the downscale step and model loading
     report no progress and can take minutes on a long video.
+    write(session, progress) does the update and returns False once the job is no
+    longer ours. `label` names the slow step in the log ("tracking 40%"), `scale`
+    keeps the last part of the progress bar for saving the results.
     """
 
     def __init__(
         self,
         engine: Engine,
-        video_id: uuid.UUID,
-        claim_id: uuid.UUID,
+        write: Callable[[Session, float], bool],
         interval: float,
         log: JobLog,
+        label: str = "tracking",
+        scale: float = 0.95,
     ) -> None:
-        super().__init__(daemon=True, name=f"heartbeat-{video_id}")
-        self.engine, self.video_id, self.claim_id = engine, video_id, claim_id
+        super().__init__(daemon=True, name=f"heartbeat{log.prefix}")
+        self.engine, self.write = engine, write
         self.interval = interval
         self.log = log
+        self.label, self.scale = label, scale
         self.progress = 0.0
         self.logged_percent = 0
         self.lost = threading.Event()
         self._stop_event = threading.Event()
 
     def on_progress(self, fraction: float) -> None:
-        """Pipeline callback (tracking progress 0-1). Raises JobLost to stop the
-        pipeline early."""
+        """Pipeline callback (progress 0-1 of the slow step). Raises JobLost to stop
+        the pipeline early."""
         if self.lost.is_set():
             raise JobLost
-        # Tracking is ~all of the work; keep 100% for when the rallies are saved
-        self.progress = 0.95 * fraction
+        self.progress = self.scale * fraction
         percent = int(fraction * 100) // TRACKING_LOG_STEP * TRACKING_LOG_STEP
         if percent > self.logged_percent:
             self.logged_percent = percent
-            self.log.info(f"tracking {percent}%")
+            self.log.info(f"{self.label} {percent}%")
 
     def beat(self) -> None:
         try:
             with Session(self.engine) as session:
-                ours = crud.heartbeat_video(
-                    session=session,
-                    video_id=self.video_id,
-                    claim_id=self.claim_id,
-                    progress=self.progress,
-                )
+                ours = self.write(session, self.progress)
         except OperationalError:
             # Database briefly unreachable: keep working, try again next beat
             self.log.warning("heartbeat failed (database unreachable); retrying")
@@ -269,28 +322,62 @@ class Heartbeat(threading.Thread):
         self.join()
 
 
+def rescue_stale_jobs(session: Session, stale_after: timedelta) -> None:
+    for kind, rescue in (
+        ("exports", crud.requeue_stale_exports),
+        ("videos", crud.requeue_stale_videos),
+    ):
+        requeued, gave_up = rescue(session=session, stale_after=stale_after)
+        if requeued or gave_up:
+            logger.warning(
+                "stale %s (worker stopped responding): %d re-queued, %d failed",
+                kind,
+                requeued,
+                gave_up,
+            )
+
+
+def claim_export(session: Session, worker_name: str) -> ExportJob | None:
+    export = crud.claim_next_export(session=session, claimed_by=worker_name)
+    if export is None:
+        return None
+    assert export.claim_id is not None
+    video = session.get(Video, export.video_id)
+    assert video is not None  # exports go with their video (database cascade)
+    return ExportJob(
+        id=export.id,
+        video_id=export.video_id,
+        claim_id=export.claim_id,
+        title=export.title,
+        format=export.format,
+        quality=export.quality,
+        snapshot=export.snapshot,
+        source=settings.STORAGE_DIR / video.storage_path,
+        attempts=export.attempts,
+    )
+
+
 def process_one(
     processor: Processor,
     worker_name: str,
     engine: Engine = default_engine,
     heartbeat_seconds: float = HEARTBEAT_SECONDS,
     stale_after: timedelta = STALE_AFTER,
+    renderer: ExportRenderer = render_export,
 ) -> bool:
-    """Rescue stale jobs, then claim and process one video.
+    """Rescue stale jobs, then claim and process one job: an export if one is
+    queued (they take seconds to minutes), else a video.
     Returns False if there was nothing to do.
 
     Logs one line per phase: claimed, prepared, tracking N%, detecting rallies,
     then done / failed (with the reason) / lost / stopped."""
     with Session(engine) as session:
-        requeued, gave_up = crud.requeue_stale_videos(
-            session=session, stale_after=stale_after
-        )
-        if requeued or gave_up:
-            logger.warning(
-                "stale jobs (worker stopped responding): %d re-queued, %d failed",
-                requeued,
-                gave_up,
-            )
+        rescue_stale_jobs(session, stale_after)
+        export = claim_export(session, worker_name)
+    if export is not None:
+        return run_export(export, renderer, engine, heartbeat_seconds)
+
+    with Session(engine) as session:
         video = crud.claim_next_video(session=session, claimed_by=worker_name)
         if video is None:
             return False
@@ -305,7 +392,14 @@ def process_one(
         )
 
     work_dir = settings.STORAGE_DIR / str(video_id) / "work"
-    heartbeat = Heartbeat(engine, video_id, claim_id, heartbeat_seconds, log)
+    heartbeat = Heartbeat(
+        engine,
+        lambda session, progress: crud.heartbeat_video(
+            session=session, video_id=video_id, claim_id=claim_id, progress=progress
+        ),
+        heartbeat_seconds,
+        log,
+    )
     heartbeat.start()
     started = time.monotonic()
     # Everything after the claim is inside this try, not just the pipeline call:
@@ -342,7 +436,20 @@ def process_one(
         raise
     except Exception as e:
         heartbeat.stop()
-        record_failure(engine, video_id, claim_id, e, log)
+        reason = failure_reason(e)
+        record_failure(
+            engine,
+            e,
+            log,
+            reason,
+            lambda session, details: crud.fail_video(
+                session=session,
+                video_id=video_id,
+                claim_id=claim_id,
+                reason=reason,
+                error=details,
+            ),
+        )
         return True
 
     if saved:
@@ -357,6 +464,99 @@ def process_one(
     else:
         log.warning("lost: results discarded, another worker has this job now")
     return True
+
+
+def run_export(
+    job: ExportJob, renderer: ExportRenderer, engine: Engine, heartbeat_seconds: float
+) -> bool:
+    """Render a claimed export and save the result. Like a video job: a failure
+    fails this export only; deleting the export (or its video) meanwhile stops the
+    render at the next progress update and discards the file."""
+    log = JobLog(job.id)
+    expected = float(job.snapshot.get("duration", 0))
+    log.info(
+        f"claimed export: {job.title!r}, {job.format} {job.quality}, "
+        f"{expected:.1f} s, attempt {job.attempts}/{crud.MAX_ATTEMPTS}"
+    )
+    width, height = EXPORT_SIZES[(job.format, job.quality)]
+    relative = export_output_path(job.video_id, job.id)
+    out_path = settings.STORAGE_DIR / relative
+    heartbeat = Heartbeat(
+        engine,
+        lambda session, progress: crud.heartbeat_export(
+            session=session, export_id=job.id, claim_id=job.claim_id, progress=progress
+        ),
+        heartbeat_seconds,
+        log,
+        label="rendering",
+        scale=0.99,
+    )
+    heartbeat.start()
+    started = time.monotonic()
+    try:
+        result = renderer(
+            job.source, job.snapshot, width, height, out_path,
+            heartbeat.on_progress, log.info,
+        )  # fmt: skip
+        heartbeat.stop()
+        with Session(engine) as session:
+            saved = crud.finish_export(
+                session=session,
+                export_id=job.id,
+                claim_id=job.claim_id,
+                output_path=relative,
+                size_bytes=int(result["size_bytes"]),
+                duration=float(result["duration"]),
+            )
+    except JobLost:
+        heartbeat.stop()
+        out_path.unlink(missing_ok=True)
+        log.warning("lost: deleted, or another worker has this export now; stopped")
+        return True
+    except KeyboardInterrupt:
+        heartbeat.stop()
+        with Session(engine) as session:
+            crud.release_export(
+                session=session, export_id=job.id, claim_id=job.claim_id
+            )
+        log.info("stopped (Ctrl+C); back in the queue")
+        raise
+    except Exception as e:
+        heartbeat.stop()
+        out_path.unlink(missing_ok=True)
+        reason = export_failure_reason(e)
+        record_failure(
+            engine,
+            e,
+            log,
+            reason,
+            lambda session, details: crud.fail_export(
+                session=session,
+                export_id=job.id,
+                claim_id=job.claim_id,
+                reason=reason,
+                error=details,
+            ),
+        )
+        return True
+
+    if saved:
+        log.info(
+            f"done: export {result['size_bytes'] / 1e6:.1f} MB, "
+            f"{result['duration']:.1f} s, in {fmt_duration(time.monotonic() - started)}"
+        )
+    else:
+        out_path.unlink(missing_ok=True)
+        log.warning("lost: export discarded (deleted, or another worker has it now)")
+    return True
+
+
+TEXT_LAYOUT_HELP = (
+    "Pillow has no complex text layout (raqm), which Thai captions need. Install "
+    "FriBiDi: on macOS `brew install fribidi` and start the worker with "
+    "DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib; on "
+    "Linux `apt install libfribidi0`."
+)
 
 
 def main() -> None:
@@ -382,6 +582,10 @@ def main() -> None:
     )
 
     worker_name = f"{socket.gethostname()}:{os.getpid()}"
+    # Exports with Thai captions would render wrongly without it: refuse to start
+    if not caption_image.check_text_layout():
+        logger.error("Not starting: %s", TEXT_LAYOUT_HELP)
+        sys.exit(1)
     detector = settings.DETECTOR_VERSION
     # Load the detector's model now: a missing or mismatched model file should stop
     # the worker at start, not fail every video it claims.
@@ -432,6 +636,7 @@ def serve_forever(
     stale_after: timedelta = STALE_AFTER,
     engine: Engine = default_engine,
     heartbeat_seconds: float = HEARTBEAT_SECONDS,
+    renderer: ExportRenderer = render_export,
 ) -> None:
     """Process jobs until Ctrl+C (or one job with once=True). Nothing a job does
     stops the loop; only Ctrl+C does."""
@@ -444,6 +649,7 @@ def serve_forever(
                     engine=engine,
                     heartbeat_seconds=heartbeat_seconds,
                     stale_after=stale_after,
+                    renderer=renderer,
                 )
             except OperationalError as e:
                 logger.error("Database unavailable (%s); retrying", e.orig)

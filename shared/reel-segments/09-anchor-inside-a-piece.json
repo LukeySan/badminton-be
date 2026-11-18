@@ -1,0 +1,72 @@
+{
+  "description": "The break 21-29 was restored (anchor 25). Then a rally fix moved rally 2 to start at 25 and its piece now starts at 24: the anchor is inside a piece, so it restores nothing (21-24 stays hidden). The next save drops it.",
+  "duration": 60,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 25,
+      "end": 40
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      25
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 21,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 24,
+            "end": 41,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 21,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 24,
+        "end": 41,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 29
+  }
+}

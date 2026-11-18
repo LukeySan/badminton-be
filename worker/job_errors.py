@@ -17,3 +17,7 @@ class VideoUnreadable(PipelineError):
 class CourtNotVisible(PipelineError):
     """The shuttle was (almost) never seen inside the marked court: wrong corners,
     or the court isn't really in view."""
+
+
+class SourceUnreadable(PipelineError):
+    """Exports: the original upload is missing or ffprobe can't read it."""

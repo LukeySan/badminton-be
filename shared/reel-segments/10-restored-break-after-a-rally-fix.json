@@ -1,0 +1,83 @@
+{
+  "description": "Rally 2 was fixed to start at 27 (its window starts at 26) and its first 3 s, 26-29, were deleted (a cut). The restored break (anchor 25) stops at the cut: 21-26 plays, the deleted 26-29 never does.",
+  "duration": 60,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 27,
+      "end": 40
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      25
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 21,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 29,
+            "end": 41,
+            "slow_mo": false
+          }
+        ],
+        "cuts": [
+          {
+            "start": 26,
+            "end": 29
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 21,
+        "slow_mo": false
+      },
+      {
+        "kind": "gap",
+        "start": 21,
+        "end": 26,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 29,
+        "end": 41,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 29
+  }
+}

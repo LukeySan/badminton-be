@@ -30,12 +30,16 @@ backend/             FastAPI API (the template's "app" package)
     trajectory.py      reads the per-video shuttle trajectory file
     thumbnails.py      finds the per-video thumbnail strip files
     reel_ops.py        adjusts reels when rallies change (pure functions)
+    export_snapshot.py what an export plays, fixed when it's requested (pure)
+    purge.py           deletes exported MP4s 7 days after they were requested
     core/              settings, database engine, password + token security
     alembic/versions/  database migrations
   tests/             pytest (incl. the worker loop, with a fake pipeline)
   scripts/           prestart (migrate + create admin), test, lint, format
 worker/              processing: 512x288 analysis copy → TrackNet shuttle tracking → rally detection
-  run_worker.py        the job loop: claims queued videos, runs the pipeline
+  run_worker.py        the job loop: claims queued exports, then videos
+  reel_export.py       renders a reel export with ffmpeg (from the original upload)
+  caption_image.py     caption images (Pillow), styled like the app; fonts/ (OFL)
   pipeline.py          one video in, rallies out (also a CLI)
   detector.py          detect_rallies(): v1 (rules) or v1.1 (rules + classifier + model boundaries)
   rally_features.py    v1.1's feature code (copied from research; inference only)
@@ -46,8 +50,9 @@ worker/              processing: 512x288 analysis copy → TrackNet shuttle trac
   backfill_thumbnails.py  thumbnail strips for videos analyzed before they existed
   tracknet/            TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/               model weights (not in git, see below)
+shared/reel-segments/  fixtures: what an export plays (the frontend tests the same files)
 compose.yml          local Postgres, Adminer (DB browser), Mailpit (test emails)
-storage/             per video: original, thumbnails/, trajectory.json.gz, work/ (not in git)
+storage/             per video: original, thumbnails/, trajectory.json.gz, exports/, work/ (not in git)
 ```
 
 The API and worker share one repo (and one uv environment) because the worker uses the
@@ -60,7 +65,7 @@ You need [Homebrew](https://brew.sh), [Docker Desktop](https://www.docker.com/pr
 and [uv](https://docs.astral.sh/uv/) (`brew install uv`). uv installs Python 3.14 itself.
 
 ```bash
-brew install ffmpeg
+brew install ffmpeg fribidi   # fribidi: Thai captions in exported reels (see The worker)
 cd badminton-backend
 cp .env.example .env          # development defaults; edit if you like
 uv sync --all-packages        # API + worker dependencies into .venv/
@@ -88,6 +93,8 @@ uv run bash scripts/prestart.sh
 uv run fastapi dev
 
 # 4. In a second terminal, from the repo root: the worker that processes videos
+#    and renders exports (the export line is for Thai captions, see The worker)
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
 uv run --package worker python worker/run_worker.py
 ```
 
@@ -131,6 +138,12 @@ own videos; the superuser sees all.
 | `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved. Still saved for every video; nothing in the app depends on it now |
 | `GET /videos/{id}/reel` | The video's reel (one per video), or 404 with `code: "reel_missing"` if it has none yet |
 | `PUT /videos/{id}/reel` | Create or save it: `{title, edit, updated_at}`. `updated_at: null` creates it (201); the `updated_at` you loaded updates it (200, replaces title and edit list). Anything else (it now exists, changed or was deleted meanwhile): 409 with `code: "reel_changed"`, reload |
+| `POST /videos/{id}/reel/exports` | Export the reel to an MP4 `{quality, format}` (quality `720p` or `1080p`, default 720p; format `16:9`, `9:16` or null for the reel's) (201, queued). What's rendered is fixed now (later edits don't change it), always the Rallies-only result. 404 `reel_missing`; 409 no clips, or this reel is already exporting; 422 1080p from a smaller video; 429 three exports of yours already queued/processing |
+| `GET /videos/{id}/reel/exports` | The video's exports, newest first: status, progress, size, `filename`, `expires_at` (7 days after the request) |
+| `GET /exports/{id}` | One export (poll for status/progress; `failure_reason` when failed) |
+| `GET /exports/{id}/download` | Signed link to the finished MP4 `{url, filename, expires_at}`; 409 not done, 410 expired |
+| `GET /exports/{id}/file?token=...` | The MP4 as an attachment (`Content-Disposition`), Range supported |
+| `DELETE /exports/{id}` | Delete an export and its file (soft); stops a render in progress |
 | *deprecated* `GET /videos/{id}/reels`, `POST /videos/{id}/reels`, `GET`/`PUT`/`DELETE /reels/{id}` | The old several-reels-per-video API, kept until the frontend has switched. `POST` is now get-or-create: it returns the existing reel (200) instead of making a second one |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |
 | `GET /videos/{id}/file?token=...` | The video file; supports Range requests (seeking) |
@@ -153,7 +166,7 @@ For the beta a video has one reel (enforced by the database: a unique index on
 
 ```jsonc
 {
-  "version": 2,
+  "version": 4,
   "view": "cut",            // "cut" (rallies only) or "full"
   "format": "16:9",         // or "9:16"
   "lead_in": 1.0,           // pieces may start up to this long before their rally (0-3 s)
@@ -162,9 +175,10 @@ For the beta a video has one reel (enforced by the database: a unique index on
     {"rally_id": 271, "pieces": [               // sorted, not overlapping (may touch)
       {"start": 1.5, "end": 3.0, "slow_mo": false},
       {"start": 3.0, "end": 5.2, "slow_mo": true}   // a split: two touching pieces
-    ]}
+    ],
+     "cuts": [{"start": 0.5, "end": 1.5}]}      // deleted footage: never plays
   ],
-  "restored_gaps": [{"start": 4.43, "end": 6.0}],   // breaks shown again in cut view
+  "restored_anchors": [5.6],  // restored breaks: one time inside each (see below)
   "overlays": {"trail": true, "captions": [{"text": "What a smash", "start": 3, "end": 4}]}
 }
 ```
@@ -174,10 +188,29 @@ left is dropped when the reel is saved. Rejected with 422 (with the usual `loc`,
 `["body","edit","clips",0,"pieces",1,"end"]`): a `rally_id` that isn't one of the
 video's rallies, a piece outside its rally's bounds widened by `lead_in`/`lead_out`,
 times past the end of the video (0.1 s tolerance), unsorted or overlapping pieces,
-captions over 80 characters, unknown fields, `version` other than 2.
+captions over 80 characters, unknown fields, `version` other than 4, and cuts
+outside their rally's bounds (same rule as pieces).
 
-v1 (one `trim_start`/`trim_end` per clip) was converted by a migration: each trim became
-one piece, with `lead_in`/`lead_out` raised (up to 3 s) so the old trims still fit.
+**Deleted footage (cuts).** Deleting a piece records its range in its clip's `cuts`;
+putting it back removes it from there and merges it into the pieces. Splitting a piece
+adds nothing. Cuts never play, not even next to a restored break. Rally fixes trim,
+split, join and drop a clip's cuts exactly like its pieces. On save, cuts are sorted,
+merged and minus the clip's own pieces.
+
+**Restored breaks.** In "Rallies only" the footage no piece covers is hidden. The
+cuts split it into stretches: a stretch runs between the nearest piece or cut on each
+side (or the start / end of the video), and it plays if one of `restored_anchors` is
+inside it. So a restored break follows its pieces when a rally fix or a lead change
+moves them, and it never crosses or includes a cut. An anchor inside a piece or a cut
+does nothing; on save, those (and a second anchor in the same stretch) are dropped.
+The app's timeline and the exports use the same rule (`app/reel_ops.py` `stretches`;
+checked against shared fixtures, see Reel exports).
+
+Older versions were converted by migrations: v1 (one `trim_start`/`trim_end` per clip)
+→ v2, each trim one piece, `lead_in`/`lead_out` raised (up to 3 s) so the old trims
+still fit; v2 (`restored_gaps` as `{start, end}` ranges) → v3, one anchor at the
+middle of each range; v3 → v4, each clip's cuts = the parts of its rally's window
+(as the editor computes it) that no piece covers.
 
 **Rally corrections** (add, edit, delete, split, merge) each return what changed:
 
@@ -286,12 +319,25 @@ uv run alembic upgrade head
 ## The worker
 
 ```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib  # macOS
 uv run --package worker python worker/run_worker.py                  # until Ctrl+C
 uv run --package worker python worker/run_worker.py --once           # wait for one job, then exit
 uv run --package worker python worker/run_worker.py --batch-size 16  # on an NVIDIA GPU
 ```
 
-It checks the queue every 5 s (`--poll`), takes the oldest queued video, and sets it to
+**Why the `DYLD_...` line (macOS):** export captions are drawn with Pillow, and Thai
+needs its complex text layout (raqm), which loads FriBiDi at runtime. Pillow looks for
+it only on the default library path, which doesn't include Homebrew's
+`/opt/homebrew/lib`. The worker refuses to start without it, with this hint.
+`scripts/test.sh` sets it itself. On Linux: `apt install libfribidi0` (ffmpeg's
+packages usually bring it already).
+
+**Restart the worker after switching branches or pulling.** It loads the code once;
+mixing an old loop with new code on disk crashed it once.
+
+It checks the queue every 5 s (`--poll`). Queued **exports** go first (they take
+seconds to minutes; see "Reel exports" below). Otherwise it takes the oldest queued
+video and sets it to
 `processing` → `done` (rallies saved) or `failed` (with the error in `error`).
 The rally detector comes from `DETECTOR_VERSION` in `.env` (`v1.1` by default, `v1` for
 the old rules); each video records the version that made its rallies, and
@@ -332,6 +378,38 @@ ffmpeg, not torch; safe to run while workers run, and to run again):
 uv run --package worker python worker/backfill_thumbnails.py --dry-run   # what's missing
 uv run --package worker python worker/backfill_thumbnails.py             # make them
 uv run --package worker python worker/backfill_thumbnails.py --video <id> --force
+```
+
+### Reel exports
+
+`POST /videos/{id}/reel/exports` fixes what to render (the *snapshot*, see
+`app/export_snapshot.py`) and queues it; the worker renders it with one ffmpeg run
+(`worker/reel_export.py`) from the **original upload**, not the 512x288 analysis copy:
+
+- What plays is the app's **Rallies only** result, even if the editor shows Full
+  video: the clips' pieces in reel order (lead already included), slow-mo at half
+  speed (video `setpts` x2, audio `atempo` 0.5), and restored breaks (see Restored
+  breaks above) at normal speed. `shared/reel-segments/*.json` pins this down; the
+  frontend's timeline test checks its preview against the same files.
+- Each piece is cut frame-accurately (input seeking + re-encode, no stream copy) and
+  joined with the concat filter. 16:9 is scaled to 1280x720 / 1920x1080 (letterboxed
+  if the original isn't 16:9); 9:16 is centre-cropped, then scaled to 720x1280 /
+  1080x1920. 1080p only for an original that is at least 1080p.
+- Captions are images drawn with Pillow (Manrope ExtraBold, Noto Sans Thai for Thai;
+  bundled in `worker/fonts/` with their OFL licenses), overlaid while they're on:
+  light text on a dark rounded box near the bottom, higher up in 9:16 for the social
+  apps' buttons. Emoji aren't drawn (no bundled font has them).
+- H.264 CRF 20, yuv420p, `+faststart`; AAC audio (a silent track if the original has
+  none). No `-r`: frames keep their timestamps, so variable-frame-rate phone video
+  keeps its timing.
+- Same claim/heartbeat/attempt rules as videos. Deleting an export (or its video)
+  stops a running render.
+
+Files live in `storage/<video id>/exports/` and are deleted 7 days after the request
+(`expires_at` in the API) by the purge command. Run it regularly (cron, launchd):
+
+```bash
+cd backend && uv run python -m app.purge   # safe to run any time, and again
 ```
 
 **Log lines.** One line per phase, prefixed with the video's short id so jobs from
@@ -405,6 +483,9 @@ Settings come from `.env` (see `.env.example` for all of them). The main ones:
 | `MAX_UPLOAD_BYTES` | 2000000000 | Largest upload (2 GB, as phones count it) |
 | `MAX_VIDEO_MINUTES` | 60 | Longest video |
 | `MAX_ACTIVE_VIDEOS_PER_USER` | 2 | Videos one user can have queued or processing at once |
+| `MAX_ACTIVE_EXPORTS_PER_USER` | 3 | Reel exports one user can have queued or processing |
+| `EXPORT_RETENTION_DAYS` | 7 | Exported MP4s are deleted this long after the request (`app/purge.py`) |
+| `MAX_EXPORT_SEGMENTS` | 200 | Pieces + restored breaks per export (bounds the worker's memory) |
 
 `.env` is gitignored: never commit real secrets. With `FASTAPI_ENV=development` the
 `changethis` defaults only cause warnings; without it the app refuses to start with them.
@@ -446,6 +527,10 @@ is outside the frame.
 - **`relation "video" does not exist`** or **`column video.claim_id does not exist`**:
   run `uv run bash scripts/prestart.sh` in `backend/` (applies new migrations).
 - **Videos stay `queued`**: the worker isn't running (`worker/run_worker.py`).
+- **Exports stay `queued`**: same, or the worker was started before exports existed
+  (restart it).
+- **Worker says "Not starting: Pillow has no complex text layout (raqm)"**:
+  `brew install fribidi` and set `DYLD_FALLBACK_LIBRARY_PATH` (see The worker).
 - **A video failed with `FileNotFoundError ... TrackNet_best.pt`**: copy the model weights
   into `worker/ckpts/` (see Setup), then queue the video again.
 - **A different Python environment is active** (uv warns that `VIRTUAL_ENV` doesn't

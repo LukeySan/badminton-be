@@ -45,12 +45,13 @@ jobs:
       # The video endpoints use ffprobe/ffmpeg, and the tests make sample videos
       # with it. A stalled package mirror once hung this step for 10 minutes:
       # apt now gives up on a stuck download after 30 s and retries.
+      # libfribidi0: Pillow's complex text layout (Thai captions in reel exports)
       - name: Install ffmpeg
         timeout-minutes: 5
         run: |
           APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
           sudo apt-get $APT_OPTS update
-          sudo apt-get $APT_OPTS install -y --no-install-recommends ffmpeg
+          sudo apt-get $APT_OPTS install -y --no-install-recommends ffmpeg libfribidi0
           ffprobe -version | head -n 1
       # .env is gitignored; the example's development defaults are fine for CI
       - timeout-minutes: 1
