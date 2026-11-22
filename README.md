@@ -29,7 +29,6 @@ backend/             FastAPI API (the template's "app" package)
     media.py           ffprobe/ffmpeg helpers (video info, frames)
     trajectory.py      reads the per-video shuttle trajectory file
     thumbnails.py      finds the per-video thumbnail strip files
-    reel_ops.py        adjusts reels when rallies change (pure functions)
     export_snapshot.py what an export plays, fixed when it's requested (pure)
     purge.py           deletes exported MP4s 7 days after they were requested
     core/              settings, database engine, password + token security
@@ -50,7 +49,6 @@ worker/              processing: 512x288 analysis copy → TrackNet shuttle trac
   backfill_thumbnails.py  thumbnail strips for videos analyzed before they existed
   tracknet/            TrackNetV3 inference code (MIT, see LICENSE there)
   ckpts/               model weights (not in git, see below)
-shared/reel-segments/  fixtures: what an export plays (the frontend tests the same files)
 compose.yml          local Postgres, Adminer (DB browser), Mailpit (test emails)
 storage/             per video: original, thumbnails/, trajectory.json.gz, exports/, work/ (not in git)
 ```
@@ -138,7 +136,7 @@ own videos; the superuser sees all.
 | `GET /videos/{id}/trajectory?start=&end=` | Shuttle position for every frame in that time range (max 600 s): `{fps, start, end, points: [{frame, t, visible, x, y}]}`, x/y as fractions like the court. 404 with `code: "trajectory_missing"` for videos analyzed before trajectories were saved. Still saved for every video; nothing in the app depends on it now |
 | `GET /videos/{id}/reel` | The video's reel (one per video), or 404 with `code: "reel_missing"` if it has none yet |
 | `PUT /videos/{id}/reel` | Create or save it: `{title, edit, updated_at}`. `updated_at: null` creates it (201); the `updated_at` you loaded updates it (200, replaces title and edit list). Anything else (it now exists, changed or was deleted meanwhile): 409 with `code: "reel_changed"`, reload |
-| `POST /videos/{id}/reel/exports` | Export the reel to an MP4 `{quality, format}` (quality `720p` or `1080p`, default 720p; format `16:9`, `9:16` or null for the reel's) (201, queued). What's rendered is fixed now (later edits don't change it), always the Rallies-only result. 404 `reel_missing`; 409 no clips, or this reel is already exporting; 422 1080p from a smaller video; 429 three exports of yours already queued/processing |
+| `POST /videos/{id}/reel/exports` | Export the reel to an MP4 `{quality, format}` (quality `720p` or `1080p`, default 720p; format `16:9`, `9:16` or null for the reel's) (201, queued). What's rendered is fixed now (later edits don't change it): the segments in order. 404 `reel_missing`; 409 no clips, or this reel is already exporting; 422 1080p from a smaller video; 429 three exports of yours already queued/processing |
 | `GET /videos/{id}/reel/exports` | The video's exports, newest first: status, progress, size, `filename`, `expires_at` (7 days after the request) |
 | `GET /exports/{id}` | One export (poll for status/progress; `failure_reason` when failed) |
 | `GET /exports/{id}/download` | Signed link to the finished MP4 `{url, filename, expires_at}`; 409 not done, 410 expired |
@@ -167,51 +165,33 @@ For the beta a video has one reel (enforced by the database: a unique index on
 
 ```jsonc
 {
-  "version": 4,
-  "view": "cut",            // "cut" (rallies only) or "full"
-  "format": "16:9",         // or "9:16"
-  "lead_in": 1.0,           // pieces may start up to this long before their rally (0-3 s)
-  "lead_out": 1.0,          // ...and end this long after it (0-3 s)
-  "clips": [                // in reel order, one rally each
-    {"rally_id": 271, "pieces": [               // sorted, not overlapping (may touch)
-      {"start": 1.5, "end": 3.0, "slow_mo": false},
-      {"start": 3.0, "end": 5.2, "slow_mo": true}   // a split: two touching pieces
-    ],
-     "cuts": [{"start": 0.5, "end": 1.5}]}      // deleted footage: never plays
-  ],
-  "restored_anchors": [5.6],  // restored breaks: one time inside each (see below)
-  "overlays": {"trail": true, "captions": [{"text": "What a smash", "start": 3, "end": 4}]}
+  "version": 5,
+  "format": "16:9",           // or "9:16"
+  "segments": [               // in playback order: the reel is these, one after another
+    {"id": "c3", "start": 71.0, "end": 94.0, "slow_mo": false, "rally_id": 271},
+    {"id": "c3b", "start": 80.5, "end": 84.0, "slow_mo": true, "rally_id": 271},  // a replay
+    {"id": "x1", "start": 744.0, "end": 752.0, "slow_mo": false, "rally_id": null} // footage
+  ],                                                                               // outside rallies
+  "captions": [{"text": "What a smash", "start": 82, "end": 84}]  // source seconds
 }
 ```
 
-Splitting a piece makes two pieces; deleting a piece removes it; a clip with no pieces
-left is dropped when the reel is saved. Rejected with 422 (with the usual `loc`, e.g.
-`["body","edit","clips",0,"pieces",1,"end"]`): a `rally_id` that isn't one of the
-video's rallies, a piece outside its rally's bounds widened by `lead_in`/`lead_out`,
-times past the end of the video (0.1 s tolerance), unsorted or overlapping pieces,
-captions over 80 characters, unknown fields, `version` other than 4, and cuts
-outside their rally's bounds (same rule as pieces).
-
-**Deleted footage (cuts).** Deleting a piece records its range in its clip's `cuts`;
-putting it back removes it from there and merges it into the pieces. Splitting a piece
-adds nothing. Cuts never play, not even next to a restored break. Rally fixes trim,
-split, join and drop a clip's cuts exactly like its pieces. On save, cuts are sorted,
-merged and minus the clip's own pieces.
-
-**Restored breaks.** In "Rallies only" the footage no piece covers is hidden. The
-cuts split it into stretches: a stretch runs between the nearest piece or cut on each
-side (or the start / end of the video), and it plays if one of `restored_anchors` is
-inside it. So a restored break follows its pieces when a rally fix or a lead change
-moves them, and it never crosses or includes a cut. An anchor inside a piece or a cut
-does nothing; on save, those (and a second anchor in the same stretch) are dropped.
-The app's timeline and the exports use the same rule (`app/reel_ops.py` `stretches`;
-checked against shared fixtures, see Reel exports).
+A reel is a flat list of segments (Editor v2): stretches of the original video, played
+in list order. Segment times are seconds in the original video, stored to 0.1 s, at
+least 0.3 s long, inside the video (0.1 s tolerance). Segments may overlap in source
+time (a replay), at most 200 per reel. `id` is the app's (unique within the reel).
+`rally_id` is a label only: null for footage from outside the rallies, and a rally
+that no longer exists reads as null (its footage keeps playing). A caption shows while
+the source time is inside it, in every segment that shows that time.
+Rejected with 422 (with the usual `loc`, e.g. `["body","edit","segments",2,"end"]`):
+segments shorter than 0.3 s, backwards, past the end of the video, repeated ids,
+captions over 80 characters, unknown fields, `version` other than 5.
 
 Older versions were converted by migrations: v1 (one `trim_start`/`trim_end` per clip)
-→ v2, each trim one piece, `lead_in`/`lead_out` raised (up to 3 s) so the old trims
-still fit; v2 (`restored_gaps` as `{start, end}` ranges) → v3, one anchor at the
-middle of each range; v3 → v4, each clip's cuts = the parts of its rally's window
-(as the editor computes it) that no piece covers.
+→ v2 pieces with lead-in/out; v2 → v3 restored breaks as anchors; v3 → v4 deleted
+footage as cuts; v4 → v5 each reel became exactly the segments its "Rallies only"
+playback played (pieces with their lead, and restored breaks as unlabelled segments),
+in the same order, times rounded to 0.1 s.
 
 **Rally corrections** (add, edit, delete, split, merge) each return what changed:
 
@@ -220,25 +200,21 @@ middle of each range; v3 → v4, each clip's cuts = the parts of its rally's win
   "added": [{"id": 3477, "number": 2, "start": 6.0, "end": 8.0, "duration": 2.0}],
   "updated": [{"id": 3474, "number": 1, "start": 2.0, "end": 6.0, "duration": 4.0}],
   "deleted": [],
-  "rallies": [ /* the whole list, renumbered in time order */ ],
-  "reels": [{"id": "...", "title": "Best rallies", "updated_at": "...",
-             "clips_removed": 0, "pieces_trimmed": 1, "pieces_removed": 0}]
+  "rallies": [ /* the whole list, renumbered in time order */ ]
 }
 ```
 
 - Rallies can't overlap (touching is fine): 409 otherwise. Merge only takes neighbours.
   Not allowed while the video is queued or processing (409): re-analysis replaces all
   rallies.
-- Reels follow: pieces outside a rally's new bounds (+ lead) are trimmed; a deleted
-  rally's clips are dropped; a split splits the clip the same way; a merge points both
-  rallies' clips at the new rally and joins a clip of the first directly followed by one
-  of the second. Changed reels get a new `updated_at`, so an editor with an old copy
-  gets 409 `reel_changed` and reloads.
+- Reels aren't changed: their segments are times in the video. A deleted rally's
+  segments (also after a merge or re-analysis, which replace rallies) keep playing,
+  their `rally_id` reads as null; an editor that has the reel open isn't disturbed.
 - Every change is logged in the `correction` table with the detector's original bounds
   (kept on each rally as `detected_start`/`detected_end`), the new bounds and who made
   it: detector output vs. the user's correction, for training a better detector later.
 - Re-analyzing a video replaces all its rallies (corrections included) with the
-  detector's; reel clips move to the new rally overlapping them most.
+  detector's.
 
 **Thumbnail strip.** One 160 px wide frame per second, in sprite sheets of 10 x 10
 tiles. Fetch `index_url` first:
@@ -387,11 +363,9 @@ uv run --package worker python worker/backfill_thumbnails.py --video <id> --forc
 `app/export_snapshot.py`) and queues it; the worker renders it with one ffmpeg run
 (`worker/reel_export.py`) from the **original upload**, not the 512x288 analysis copy:
 
-- What plays is the app's **Rallies only** result, even if the editor shows Full
-  video: the clips' pieces in reel order (lead already included), slow-mo at half
-  speed (video `setpts` x2, audio `atempo` 0.5), and restored breaks (see Restored
-  breaks above) at normal speed. `shared/reel-segments/*.json` pins this down; the
-  frontend's timeline test checks its preview against the same files.
+- What plays is the reel's segments in order, slow-mo ones at half speed (video
+  `setpts` x2, audio `atempo` 0.5). Exports made before edit list v5 keep the
+  snapshot they were made with.
 - Each piece is cut frame-accurately (input seeking + re-encode, no stream copy) and
   joined with the concat filter. 16:9 is scaled to 1280x720 / 1920x1080 (letterboxed
   if the original isn't 16:9); 9:16 is centre-cropped, then scaled to 720x1280 /
@@ -486,7 +460,6 @@ Settings come from `.env` (see `.env.example` for all of them). The main ones:
 | `MAX_ACTIVE_VIDEOS_PER_USER` | 2 | Videos one user can have queued or processing at once |
 | `MAX_ACTIVE_EXPORTS_PER_USER` | 3 | Reel exports one user can have queued or processing |
 | `EXPORT_RETENTION_DAYS` | 7 | Exported MP4s are deleted this long after the request (`app/purge.py`) |
-| `MAX_EXPORT_SEGMENTS` | 200 | Pieces + restored breaks per export (bounds the worker's memory) |
 
 `.env` is gitignored: never commit real secrets. With `FASTAPI_ENV=development` the
 `changethis` defaults only cause warnings; without it the app refuses to start with them.

@@ -1,4 +1,3 @@
-import itertools
 import re
 import unicodedata
 import uuid
@@ -13,6 +12,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     computed_field,
+    field_validator,
     model_validator,
 )
 from pydantic import Field as PydanticField
@@ -389,21 +389,10 @@ class RallyMerge(SQLModel):
     )
 
 
-class ReelImpact(SQLModel):
-    """How a reel was adjusted to a rally change."""
-
-    id: uuid.UUID
-    title: str
-    updated_at: datetime = Field(description="New version: an open editor must reload")
-    clips_removed: int = Field(description="Clips dropped (their rally is gone, or "
-                               "nothing of them was left inside the new bounds)")  # fmt: skip
-    pieces_trimmed: int = Field(description="Pieces cut back to the new bounds")
-    pieces_removed: int = Field(description="Pieces entirely outside the new bounds")
-
-
 class RallyChange(SQLModel):
     """What a correction changed, so the app can update its list and tell the user
-    (e.g. "Rally 5 split into 5 and 6; 1 reel updated")."""
+    (e.g. "Rally 5 split into 5 and 6"). Reels aren't changed: their segments are
+    just times (a deleted rally's segments keep playing, labelled rally_id null)."""
 
     added: list[RallyPublic]
     updated: list[RallyPublic] = Field(description="Rallies whose start/end changed")
@@ -411,7 +400,6 @@ class RallyChange(SQLModel):
     rallies: list[RallyPublic] = Field(
         description="All the video's rallies after the change, numbered in time order"
     )
-    reels: list[ReelImpact] = Field(description="Reels that had to be adjusted")
 
 
 # ---------------------------------------------------------------------------
@@ -465,14 +453,15 @@ class TrajectoryPublic(SQLModel):
 
 REEL_TITLE_MAX_LENGTH = 100
 CAPTION_MAX_LENGTH = 80
-MAX_REEL_ITEMS = 500  # clips / restored anchors / captions per reel
+MAX_REEL_ITEMS = 500  # captions per reel
+# Segments per reel. Also the export's limit: ffmpeg opens the original once per
+# segment (frame-accurate seeks), so this bounds the worker's memory.
+MAX_REEL_SEGMENTS = 200
+MIN_SEGMENT_SECONDS = 0.3
+SEGMENT_PRECISION = 1  # decimals: start/end are stored to 0.1 s
+SEGMENT_ID_MAX_LENGTH = 64
 # The app's player may report a slightly different duration than ffprobe did
 TRIM_TOLERANCE = 0.1  # seconds
-MAX_LEAD = 3.0  # lead_in / lead_out: how far pieces may go past a rally's bounds
-DEFAULT_LEAD = 1.0
-# Float slack when comparing a piece with its rally's bounds: the app computes
-# "rally start - lead_in" in JavaScript, which may differ in the last digits
-BOUND_TOLERANCE = 0.01
 
 
 class EditModel(BaseModel):
@@ -492,34 +481,38 @@ class TimeRange(EditModel):
         return self
 
 
-class Piece(TimeRange):
-    slow_mo: bool = False
+class Segment(EditModel):
+    """One clip of the reel: a stretch of the original video."""
 
-
-class ReelClip(EditModel):
-    rally_id: int = PydanticField(description="The rally this clip shows")
-    pieces: list[Piece] = PydanticField(
-        default=[],
-        max_length=MAX_REEL_ITEMS,
-        description="The parts of the rally to show: sorted, not overlapping (they "
-        "may touch, e.g. after a split), within the rally's bounds widened by the "
-        "reel's lead_in/lead_out. A clip without pieces is dropped when saved.",
+    id: str = PydanticField(
+        min_length=1,
+        max_length=SEGMENT_ID_MAX_LENGTH,
+        description="Chosen by the app, unique within the reel; kept as is",
+    )
+    start: float = PydanticField(
+        ge=0, description="Seconds in the original video, stored to 0.1 s"
+    )
+    end: float = PydanticField(ge=0, description="Seconds, after start (>= 0.3 s)")
+    slow_mo: bool = PydanticField(default=False, description="Plays at half speed")
+    rally_id: int | None = PydanticField(
+        default=None,
+        description="Label only: the rally this footage shows; null for footage from "
+        "outside the rallies, and for a rally that was deleted since. Never "
+        "changes what plays.",
     )
 
-    cuts: list[TimeRange] = PydanticField(
-        default=[],
-        max_length=MAX_REEL_ITEMS,
-        description="Footage of this clip the user deleted: never played, not even "
-        "in a restored break next to it, and a restored break stops at a cut. Same "
-        "bounds as pieces. Putting a cut back removes it from here and adds it to "
-        "the pieces. On save: sorted, merged, and what the pieces cover removed.",
-    )
+    @field_validator("start", "end")
+    @classmethod
+    def to_precision(cls, value: float) -> float:
+        return round(value, SEGMENT_PRECISION)
 
     @model_validator(mode="after")
-    def check_pieces(self) -> Self:
-        for before, after in itertools.pairwise(self.pieces):
-            if after.start < before.end:
-                raise ValueError("pieces must be sorted and must not overlap")
+    def check_length(self) -> Self:
+        if self.end - self.start < MIN_SEGMENT_SECONDS - 1e-9:
+            raise ValueError(
+                f"a segment must be at least {MIN_SEGMENT_SECONDS} s long (end after "
+                "start)"
+            )
         return self
 
 
@@ -527,90 +520,68 @@ class Caption(TimeRange):
     text: str = PydanticField(min_length=1, max_length=CAPTION_MAX_LENGTH)
 
 
-class ReelOverlays(EditModel):
-    trail: bool = False  # draw the shuttle trail (needs GET /videos/{id}/trajectory)
-    captions: list[Caption] = PydanticField(default=[], max_length=MAX_REEL_ITEMS)
-
-
-Lead = Annotated[float, PydanticField(ge=0, le=MAX_LEAD)]
 ReelFormat = Literal["16:9", "9:16"]
-
-
-Anchor = Annotated[float, PydanticField(ge=0)]
 
 
 class ReelEdit(EditModel):
     """The edit list, stored as JSON. `version` changes when the format does; an
     Alembic migration converts stored reels, so the code only knows the current one.
-    v4 (this): clips record deleted footage as cuts, which never play and bound
-    restored breaks. v3 made a restored break an anchor (one time inside it) so it
-    follows its neighbouring pieces; v2 stored restored breaks as {start, end}
-    ranges; v1 had one trim per clip instead of pieces."""
+    v5 (this): a flat list of segments in playback order (Editor v2). v4 and before
+    described a reel as rally clips cut into pieces, with lead-in/out, deleted cuts
+    and restored breaks; migration 8f3a5c2d9e14 turned each into the segments it
+    played."""
 
-    version: Literal[4] = 4
-    view: Literal["cut", "full"] = "cut"
+    version: Literal[5] = 5
     format: ReelFormat = "16:9"
-    lead_in: Lead = PydanticField(
-        default=DEFAULT_LEAD,
-        description="Seconds a piece may start before its rally's detected start "
-        "(0-3; the detector can be 1-2 s off)",
+    segments: list[Segment] = PydanticField(
+        default=[],
+        max_length=MAX_REEL_SEGMENTS,
+        description="In playback order. May overlap in source time (a replay).",
     )
-    lead_out: Lead = PydanticField(
-        default=DEFAULT_LEAD,
-        description="Seconds a piece may end after its rally's detected end (0-3)",
-    )
-    clips: list[ReelClip] = PydanticField(
-        default=[], max_length=MAX_REEL_ITEMS, description="In reel order"
-    )
-    restored_anchors: list[Anchor] = PydanticField(
+    captions: list[Caption] = PydanticField(
         default=[],
         max_length=MAX_REEL_ITEMS,
-        description="Breaks shown again in 'Rallies only' (and exported): a stretch of "
-        "footage between the nearest piece or cut on each side (or the start / end of "
-        "the video) plays if one of these times (seconds) is inside it. Cuts never "
-        "play. An anchor inside a piece or a cut does nothing, and is dropped when the "
-        "reel is saved (so is a second anchor in the same stretch). See "
-        "app/reel_ops.py stretches.",
+        description="Shown while the source time is inside [start, end), in every "
+        "segment that shows it (seconds in the original video)",
     )
-    overlays: ReelOverlays = PydanticField(default_factory=ReelOverlays)
 
-    def without_empty_clips(self) -> ReelEdit:
-        return self.model_copy(update={"clips": [c for c in self.clips if c.pieces]})
+    @field_validator("segments")
+    @classmethod
+    def check_unique_ids(cls, segments: list[Segment]) -> list[Segment]:
+        seen: set[str] = set()
+        for segment in segments:
+            if segment.id in seen:
+                raise ValueError(f"segment ids must be unique: {segment.id!r} repeats")
+            seen.add(segment.id)
+        return segments
 
     def problems(
-        self, *, duration: float | None, rallies: dict[int, tuple[float, float]]
+        self, *, duration: float | None
     ) -> list[tuple[tuple[str | int, ...], str]]:
-        """Checks that need the video: (location in the edit, message) for each
-        rally_id that isn't one of the video's rallies, each piece outside its
-        rally's padded bounds, and each time past the end of the video."""
+        """Checks that need the video: (location in the edit, message) for each time
+        past its end (TRIM_TOLERANCE of slack)."""
+        if duration is None:
+            return []
+        limit = duration + TRIM_TOLERANCE
+        past_end = f"must be within the video (0-{duration:.2f} s)"
         found: list[tuple[tuple[str | int, ...], str]] = []
-        limit = None if duration is None else duration + TRIM_TOLERANCE
-        past_end = f"must be within the video (0-{duration or 0:.2f} s)"
-        for i, clip in enumerate(self.clips):
-            bounds = rallies.get(clip.rally_id)
-            if bounds is None:
-                found.append((("clips", i, "rally_id"), "not a rally of this video"))
-                continue
-            lo, hi = bounds[0] - self.lead_in, bounds[1] + self.lead_out
-            outside = (
-                f"must be within the rally ({bounds[0]:.2f}-{bounds[1]:.2f} s) "
-                f"widened by lead_in/lead_out ({max(lo, 0):.2f}-{hi:.2f} s)"
-            )
-            for kind, ranges in (("pieces", clip.pieces), ("cuts", clip.cuts)):
-                for j, piece in enumerate(ranges):
-                    if piece.start < lo - BOUND_TOLERANCE:
-                        found.append((("clips", i, kind, j, "start"), outside))
-                    if piece.end > hi + BOUND_TOLERANCE:
-                        found.append((("clips", i, kind, j, "end"), outside))
-                    elif limit is not None and piece.end > limit:
-                        found.append((("clips", i, kind, j, "end"), past_end))
-        for i, anchor in enumerate(self.restored_anchors):
-            if limit is not None and anchor > limit:
-                found.append((("restored_anchors", i), past_end))
-        for i, caption in enumerate(self.overlays.captions):
-            if limit is not None and caption.end > limit:
-                found.append((("overlays", "captions", i, "end"), past_end))
+        for i, segment in enumerate(self.segments):
+            if segment.end > limit:
+                found.append((("segments", i, "end"), past_end))
+        for i, caption in enumerate(self.captions):
+            if caption.end > limit:
+                found.append((("captions", i, "end"), past_end))
         return found
+
+    def with_known_rallies(self, rally_ids: set[int]) -> ReelEdit:
+        """rally_id is a label: one that isn't (any more) a rally of the video reads
+        as null, so a deleted rally's footage keeps playing, unlabelled."""
+        segments = [
+            s if s.rally_id is None or s.rally_id in rally_ids
+            else s.model_copy(update={"rally_id": None})
+            for s in self.segments
+        ]  # fmt: skip
+        return self.model_copy(update={"segments": segments})
 
 
 ReelTitle = Annotated[
@@ -725,14 +696,13 @@ class ExportFailureReason(StrEnum):
 
 
 class ExportSegment(BaseModel):
-    """One stretch of the original video, in output order."""
+    """One stretch of the original video, in output order. (Snapshots made before
+    edit list v5 also have a `kind`; it's ignored.)"""
 
-    kind: Literal["piece", "gap"] = PydanticField(
-        description="piece: part of a clip; gap: a restored break (normal speed)"
-    )
     start: float = PydanticField(description="Seconds in the original video")
     end: float
     slow_mo: bool = PydanticField(default=False, description="Played at half speed")
+    rally_id: int | None = PydanticField(default=None, description="Label only")
 
 
 class ExportCaption(BaseModel):

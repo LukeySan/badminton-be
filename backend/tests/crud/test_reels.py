@@ -35,37 +35,23 @@ def make_processing_video(
     return video, claim_id, [r.id for r in rallies if r.id is not None]
 
 
-def clip(rally_id: int, *pieces: tuple[float, float]) -> dict[str, object]:
-    return {
-        "rally_id": rally_id,
-        "pieces": [{"start": s, "end": e, "slow_mo": False} for s, e in pieces],
-    }
-
-
-def test_reanalysis_moves_reel_clips_to_the_new_rallies(
-    db: Session, engine: Engine
-) -> None:
-    """Re-analyzing replaces the rallies (new ids, slightly different bounds): each
-    clip moves to the new rally overlapping it most and is trimmed to its bounds;
-    a clip whose rally is gone is dropped."""
-    video, claim_id, old_ids = make_processing_video(
-        db, [(10.0, 20.0), (30.0, 45.0), (60.0, 70.0)]
-    )
+def test_reanalysis_leaves_reels_alone(db: Session, engine: Engine) -> None:
+    """Re-analyzing replaces the rallies (new ids). Reels aren't touched: their
+    segments are times, so they play the same; the old rally labels read as null
+    (an open editor isn't disturbed)."""
+    video, claim_id, old_ids = make_processing_video(db, [(10.0, 20.0), (30.0, 45.0)])
     edit = ReelEdit.model_validate(
         {
-            "clips": [
-                clip(old_ids[1], (29.0, 35.0), (40.0, 46.0)),
-                clip(old_ids[0], (9.0, 21.0)),
-                clip(old_ids[2], (61.0, 65.0)),  # no rally there after re-analysis
+            "segments": [
+                {"id": "b", "start": 29, "end": 46, "rally_id": old_ids[1]},
+                {"id": "a", "start": 9, "end": 21, "rally_id": old_ids[0]},
+                {"id": "x", "start": 50, "end": 52},
             ]
         }
     )
-    deleted = crud.create_reel(session=db, video=video, title="d", edit=edit)
-    assert deleted
-    crud.soft_delete_reel(session=db, reel_id=deleted.id)
     reel = crud.create_reel(session=db, video=video, title="r", edit=edit)
     assert reel
-    saved_at = reel.updated_at
+    saved_at, stored = reel.updated_at, dict(reel.edit)
 
     with Session(engine) as session:
         assert crud.finish_video(
@@ -83,49 +69,14 @@ def test_reanalysis_moves_reel_clips_to_the_new_rallies(
     # The detector's bounds are recorded with the rallies
     assert all((r.detected_start, r.detected_end) == key for key, r in new.items())
     db.expire_all()
-    moved = db.get(Reel, reel.id)
-    assert moved
-    second, first = new[(31.0, 44.0)].id, new[(10.5, 19.0)].id
-    assert (
-        ReelEdit.model_validate(moved.edit).clips
-        == ReelEdit.model_validate(
-            {
-                "clips": [
-                    clip(second, (30.0, 35.0), (40.0, 45.0)),
-                    clip(first, (9.5, 20.0)),
-                ]
-            }
-        ).clips
-    )
-    # Moved reels count as changed (an open editor must reload)
-    assert moved.updated_at > saved_at
-    # Deleted reels are left as they were
-    still_deleted = db.get(Reel, deleted.id)
-    assert still_deleted and still_deleted.edit["clips"][0]["rally_id"] == old_ids[1]
-    # ...and the moved reel passes validation again
-    assert not ReelEdit.model_validate(moved.edit).problems(
-        duration=120.0,
-        rallies={r.id: (r.start, r.end) for r in new.values() if r.id is not None},
-    )
-
-
-def test_reanalysis_leaves_an_unaffected_reel_alone(
-    db: Session, engine: Engine
-) -> None:
-    video, claim_id, _ = make_processing_video(db, [(10.0, 20.0)])
-    reel = crud.create_reel(session=db, video=video, title="e", edit=ReelEdit())
-    assert reel
-    saved_at = reel.updated_at
-    with Session(engine) as session:
-        crud.finish_video(
-            session=session,
-            video_id=video.id,
-            claim_id=claim_id,
-            rallies=[DetectedRally(11, 19)],
-        )
-    db.expire_all()
-    untouched = db.get(Reel, reel.id)
-    assert untouched and untouched.updated_at == saved_at
+    after = db.get(Reel, reel.id)
+    assert after and after.updated_at == saved_at and after.edit == stored
+    shown = crud.reel_public(session=db, reel=after).edit.segments
+    assert [(s.id, s.start, s.end, s.rally_id) for s in shown] == [
+        ("b", 29, 46, None),
+        ("a", 9, 21, None),
+        ("x", 50, 52, None),
+    ]
 
 
 def test_simultaneous_saves_only_one_wins(db: Session, engine: Engine) -> None:

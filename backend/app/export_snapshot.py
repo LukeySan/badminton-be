@@ -3,37 +3,28 @@ What an export renders, resolved from the reel when the export is requested and
 stored with it (Export.snapshot): later reel edits or rally fixes don't change an
 export that is queued or running. Pure: no database, no files.
 
-Always the app's "Rallies only" result, even if the editor is in "Full video" view:
-
-- pieces: the clips' pieces in reel order. Their times already include lead_in /
-  lead_out (the editor grows and shrinks pieces with the lead), so they are used as
-  stored. Slow-mo pieces play at half speed.
-- gaps: restored breaks at normal speed. The footage between neighbouring pieces
-  (sorted by time; also before the first and after the last) is hidden unless one of
-  the reel's restored_anchors is inside it; then all of it plays
-  (reel_ops.restored_regions, the same rule as the app's timeline). Each break is
-  placed right before the first piece (in reel order) that starts where it ends or
-  later; for a reel in time order that is simply time order.
-- captions: shown while the source time is inside [start, end), as in the app's
-  preview, mapped onto the output timeline (doubled inside slow-mo pieces). If
-  captions overlap, the first in the list wins, like the app.
-
-shared/reel-segments/*.json (repo root) pins this down with examples, and the
-frontend's timeline tests check its preview against the same files.
+The reel's segments in order, each cut to the video (the app may have measured its
+duration a little differently), slow-mo ones at half speed (twice as long). Captions
+are mapped onto the output timeline: shown while the source time is inside
+[start, end), in every segment that shows it (a replay shows it again), doubled
+inside slow-mo segments; where captions overlap, the first in the list wins, like
+the app.
 """
 
 from collections.abc import Iterable
 
 from app.models import (
+    Caption,
     ExportCaption,
     ExportSegment,
     ExportSnapshot,
     ReelEdit,
     ReelFormat,
 )
-from app.reel_ops import Span, kept_pieces, restored_regions
 
 SLOW_MO_FACTOR = 2.0  # slow-mo = half speed = twice as long
+
+Span = tuple[float, float]
 
 
 def _round(t: float) -> float:
@@ -63,36 +54,31 @@ def output_length(segment: ExportSegment) -> float:
 
 
 def build_segments(edit: ReelEdit, duration: float | None) -> list[ExportSegment]:
-    pieces = [
-        ExportSegment(
-            kind="piece",
-            start=_round(p.start),
-            end=_round(p.end),
-            slow_mo=p.slow_mo,
-        )
-        for p in kept_pieces(edit, duration)
-    ]
-    gaps = [
-        ExportSegment(kind="gap", start=_round(start), end=_round(end))
-        for start, end in restored_regions(edit, duration)
-        if end != float("inf")  # no duration: the last stretch has no end
-    ]  # in time order
-
-    segments: list[ExportSegment] = []
-    for segment in pieces:
-        while gaps and gaps[0].end <= segment.start:
-            segments.append(gaps.pop(0))
-        segments.append(segment)
-    return segments + gaps
+    limit = float("inf") if duration is None else duration
+    segments = []
+    for segment in edit.segments:
+        start, end = max(0.0, segment.start), min(segment.end, limit)
+        if end > start:
+            segments.append(
+                ExportSegment(
+                    start=_round(start),
+                    end=_round(end),
+                    slow_mo=segment.slow_mo,
+                    rally_id=segment.rally_id,
+                )
+            )
+    return segments
 
 
-def map_captions(edit: ReelEdit, segments: list[ExportSegment]) -> list[ExportCaption]:
+def map_captions(
+    captions: list[Caption], segments: list[ExportSegment]
+) -> list[ExportCaption]:
     out: list[ExportCaption] = []
     position = 0.0  # where the segment starts in the output
     for segment in segments:
         factor = SLOW_MO_FACTOR if segment.slow_mo else 1.0
         taken: list[Span] = []  # source time already captioned in this segment
-        for caption in edit.overlays.captions:
+        for caption in captions:
             span = (max(caption.start, segment.start), min(caption.end, segment.end))
             if span[1] <= span[0]:
                 continue
@@ -116,12 +102,12 @@ def map_captions(edit: ReelEdit, segments: list[ExportSegment]) -> list[ExportCa
 def build_snapshot(
     edit: ReelEdit, *, duration: float | None, format: ReelFormat | None = None
 ) -> ExportSnapshot:
-    """duration: the video's, to clip pieces that end a little past it (the app may
-    have measured it slightly differently). format: None = the reel's."""
+    """duration: the video's, to cut segments that end a little past it. format:
+    None = the reel's."""
     segments = build_segments(edit, duration)
     return ExportSnapshot(
         format=format or edit.format,
         segments=segments,
-        captions=map_captions(edit, segments),
+        captions=map_captions(edit.captions, segments),
         duration=_round(sum(output_length(s) for s in segments)),
     )

@@ -101,8 +101,7 @@ def set_analysis(id: uuid.UUID, body: PrivateAnalysis, session: SessionDep) -> A
     """
     Test fixture: finish a video as the worker would, with these rallies (and
     optionally a shuttle trajectory and the thumbnail strip), without running the ML
-    pipeline. Goes through crud.finish_video like a real worker, so reel clips are
-    re-linked the same way.
+    pipeline. Goes through crud.finish_video like a real worker.
     """
     video = session.get(Video, id)
     if video is None:

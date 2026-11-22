@@ -10,8 +10,8 @@ Reel exports: the video's reel rendered into an MP4 by the worker.
     DELETE /exports/{id}              soft delete (also stops a running render)
 
 What's rendered is fixed when the export is requested (the snapshot, see
-app/export_snapshot.py): always the reel's "Rallies only" result, whatever view the
-editor shows. Files are deleted EXPORT_RETENTION_DAYS (7) after the request by the
+app/export_snapshot.py): the reel's segments in order. Files are deleted
+EXPORT_RETENTION_DAYS (7) after the request by the
 purge command (app/purge.py); `expires_at` says when.
 
 Access follows the video: its owner, or a superuser (404 otherwise).
@@ -87,13 +87,10 @@ def check_quality(video: Video, quality: str) -> None:
             "that doesn't exist gives a plain 404 without a code.",
         },
         409: {
-            "description": "The reel has no clips, or an export of it is already "
+            "description": "The reel has no segments, or an export of it is already "
             "queued or processing"
         },
-        422: {
-            "description": "1080p for a video smaller than 1080p, or more pieces than "
-            "one export can take (MAX_EXPORT_SEGMENTS)"
-        },
+        422: {"description": "1080p for a video smaller than 1080p"},
         429: {"description": "Too many of your exports queued or processing"},
     },
 )
@@ -106,8 +103,7 @@ def create_export(
     """
     Export the video's reel to an MP4, rendered by a worker; poll GET /exports/{id}.
     What's rendered is fixed now: editing the reel or its rallies afterwards
-    doesn't change this export. Always the "Rallies only" result (the clips' pieces
-    and restored breaks), even when the editor is in "Full video" view.
+    doesn't change this export. Its segments in order, slow-mo ones at half speed.
     At most MAX_ACTIVE_EXPORTS_PER_USER (3) queued or processing per user (429).
     """
     video = get_video_for_user(session, current_user, id)
@@ -122,15 +118,9 @@ def create_export(
         duration=video.duration,
         format=export_in.format,
     )
-    if not any(s.kind == "piece" for s in snapshot.segments):
+    if not snapshot.segments:
         raise HTTPException(
             status_code=409, detail="The reel has no clips yet; add some to export it"
-        )
-    if len(snapshot.segments) > settings.MAX_EXPORT_SEGMENTS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"The reel has {len(snapshot.segments)} pieces and breaks; one "
-            f"export can take at most {settings.MAX_EXPORT_SEGMENTS}",
         )
     export, result = crud.create_export(
         session=session,

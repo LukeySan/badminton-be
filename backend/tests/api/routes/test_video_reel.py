@@ -45,11 +45,15 @@ def save(
     )
 
 
-def clip(rally_id: int, start: float, end: float) -> dict[str, Any]:
+def seg(
+    id: str, start: float, end: float, rally_id: int | None = None
+) -> dict[str, Any]:
     return {
+        "id": id,
+        "start": start,
+        "end": end,
+        "slow_mo": False,
         "rally_id": rally_id,
-        "pieces": [{"start": start, "end": end, "slow_mo": False}],
-        "cuts": [],
     }
 
 
@@ -69,15 +73,15 @@ def test_create_then_update(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     h, a = normal_user_token_headers, video[1][0]
-    r = save(client, h, video[0], None, edit={"clips": [clip(a, 10, 12)]})
+    r = save(client, h, video[0], None, edit={"segments": [seg("a", 10, 12, a)]})
     assert r.status_code == 201, r.text
     created = r.json()
     assert created["video_id"] == str(video[0])
-    assert created["edit"]["clips"] == [clip(a, 10, 12)]
+    assert created["edit"]["segments"] == [seg("a", 10, 12, a)]
     assert client.get(reel_url(video[0]), headers=h).json() == created
 
     r = save(client, h, video[0], created["updated_at"], title="Renamed",
-             edit={"format": "9:16", "clips": [clip(a, 11, 19)]})  # fmt: skip
+             edit={"format": "9:16", "segments": [seg("a", 11, 19, a)]})  # fmt: skip
     assert r.status_code == 200, r.text
     updated = r.json()
     assert (updated["id"], updated["created_at"]) == (
@@ -86,7 +90,7 @@ def test_create_then_update(
     )
     assert updated["title"] == "Renamed"
     assert updated["edit"]["format"] == "9:16"
-    assert updated["edit"]["clips"] == [clip(a, 11, 19)]
+    assert updated["edit"]["segments"] == [seg("a", 11, 19, a)]
     assert updated["updated_at"] != created["updated_at"]
     assert client.get(reel_url(video[0]), headers=h).json() == updated
 
@@ -136,32 +140,39 @@ def test_edit_is_validated_and_nothing_is_saved(
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> None:
-    h, a = normal_user_token_headers, video[1][0]
-    r = save(client, h, video[0], None, edit={"clips": [clip(999_999_999, 1, 2)]})
+    h = normal_user_token_headers
+    r = save(client, h, video[0], None, edit={"segments": [seg("a", 100, 130)]})
     assert r.status_code == 422
-    assert r.json()["detail"][0]["loc"] == ["body", "edit", "clips", 0, "rally_id"]
-    r = save(client, h, video[0], None, edit={"clips": [clip(a, 5, 12)]})  # 1 s lead
-    assert r.json()["detail"][0]["loc"] == [
-        "body",
-        "edit",
-        "clips",
-        0,
-        "pieces",
-        0,
-        "start",
-    ]
+    assert r.json()["detail"][0]["loc"] == ["body", "edit", "segments", 0, "end"]
+    r = save(client, h, video[0], None, edit={"segments": [seg("a", 10, 10.2)]})
+    assert r.json()["detail"][0]["loc"] == ["body", "edit", "segments", 0]
     assert client.get(reel_url(video[0]), headers=h).status_code == 404
 
 
-def test_empty_clips_are_dropped(
+def test_deleted_rally_reads_as_null_and_the_reel_is_not_changed(
     client: TestClient,
+    db: Session,
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> None:
-    a = video[1][0]
-    edit = {"clips": [{"rally_id": a, "pieces": []}, clip(a, 10, 12)]}
-    r = save(client, normal_user_token_headers, video[0], None, edit=edit)
-    assert r.json()["edit"]["clips"] == [clip(a, 10, 12)]
+    """Rally fixes don't edit reels: a deleted rally's segment keeps playing, its
+    label reads as null, and an editor that has the reel open can still save."""
+    h, (a, b) = normal_user_token_headers, video[1]
+    r = save(client, h, video[0], None, edit={"segments": [seg("a", 9, 21, a), seg("b", 29, 46, b)]})  # fmt: skip
+    loaded = r.json()
+    r = client.delete(f"{API}/videos/{video[0]}/rallies/{a}", headers=h)
+    assert r.status_code == 200, r.text
+    assert "reels" not in r.json()
+
+    now = client.get(reel_url(video[0]), headers=h).json()
+    assert now["updated_at"] == loaded["updated_at"]  # untouched
+    assert now["edit"]["segments"] == [seg("a", 9, 21, None), seg("b", 29, 46, b)]
+    stored = db.get(Reel, uuid.UUID(loaded["id"]))
+    assert stored and stored.edit["segments"][0]["rally_id"] == a  # only reads as null
+    # The open editor saves what it has (the old label): fine, stored as null
+    r = save(client, h, video[0], loaded["updated_at"], edit=loaded["edit"])
+    assert r.status_code == 200
+    assert r.json()["edit"]["segments"][0]["rally_id"] is None
 
 
 @pytest.mark.parametrize(
@@ -271,7 +282,7 @@ def test_deprecated_post_is_get_or_create(
     first = client.post(url, headers=h, json={"title": "First click"})
     assert first.status_code == 201
     again = client.post(
-        url, headers=h, json={"title": "Second click", "edit": {"view": "full"}}
+        url, headers=h, json={"title": "Second click", "edit": {"format": "9:16"}}
     )
     assert again.status_code == 200
     assert again.json() == first.json()
@@ -290,57 +301,3 @@ def test_old_routes_are_marked_deprecated() -> None:
         assert paths[API + path][method].get("deprecated") is True, (method, path)
     for method in ("get", "put"):
         assert not paths[API + "/videos/{id}/reel"][method].get("deprecated")
-
-
-def test_save_keeps_one_live_anchor_per_restored_break(
-    client: TestClient,
-    video: tuple[uuid.UUID, list[int]],
-    normal_user_token_headers: dict[str, str],
-) -> None:
-    """Restored breaks are anchors; on save, the ones that restore nothing (inside a
-    piece, e.g. after a rally fix) are dropped, and so is a second one in a break."""
-    a, b = video[1]
-    edit = {
-        "clips": [clip(a, 9, 21), clip(b, 29, 46)],
-        "restored_anchors": [24, 15, 22, 100, 21],  # 21: a piece's edge
-    }
-    r = save(client, normal_user_token_headers, video[0], None, edit=edit)
-    assert r.status_code == 201, r.text
-    assert r.json()["edit"]["restored_anchors"] == [22, 100]
-    assert r.json()["edit"]["version"] == 4
-
-    # A later save where a piece now reaches over the anchor: dropped then
-    edit = {
-        "lead_out": 3,
-        "clips": [clip(a, 9, 22.5), clip(b, 29, 46)],
-        "restored_anchors": [22, 100],
-    }
-    r = save(
-        client, normal_user_token_headers, video[0], r.json()["updated_at"], edit=edit
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["edit"]["restored_anchors"] == [100]
-
-
-def test_save_tidies_cuts_and_drops_anchors_inside_them(
-    client: TestClient,
-    video: tuple[uuid.UUID, list[int]],
-    normal_user_token_headers: dict[str, str],
-) -> None:
-    """Cuts (deleted footage) are stored sorted, merged and minus the clip's own
-    pieces; an anchor inside a cut restores nothing, so it isn't kept."""
-    a, _ = video[1]
-    edit = {
-        "clips": [
-            {
-                "rally_id": a,
-                "pieces": [{"start": 9, "end": 13, "slow_mo": False}],
-                "cuts": [{"start": 16, "end": 21}, {"start": 12, "end": 16}],
-            }
-        ],
-        "restored_anchors": [14.5, 25],
-    }
-    r = save(client, normal_user_token_headers, video[0], None, edit=edit)
-    assert r.status_code == 201, r.text
-    assert r.json()["edit"]["clips"][0]["cuts"] == [{"start": 13.0, "end": 21.0}]
-    assert r.json()["edit"]["restored_anchors"] == [25]

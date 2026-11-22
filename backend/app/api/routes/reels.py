@@ -40,10 +40,9 @@ router = APIRouter(tags=["reels"])
 
 INVALID_EDIT: dict[int | str, dict[str, Any]] = {
     422: {
-        "description": "Invalid edit list, including checks against the video: a "
-        "rally_id that isn't one of its rallies, pieces outside their rally's bounds "
-        "(+ lead_in/lead_out), times past its end. Errors have the usual `loc`, e.g. "
-        '["body", "edit", "clips", 2, "pieces", 0, "end"]'
+        "description": "Invalid edit list: e.g. a segment shorter than 0.3 s, repeated "
+        "segment ids, more than 200 segments, or times past the end of the video. "
+        'Errors have the usual `loc`, e.g. ["body", "edit", "segments", 2, "end"]'
     }
 }
 
@@ -56,16 +55,16 @@ def get_reel_for_user(session: Session, current_user: User, reel_id: uuid.UUID) 
     return reel
 
 
-def check_edit_against_video(session: Session, video: Video, edit: ReelEdit) -> None:
-    """The checks Pydantic can't do alone, because they need the video's rallies
-    and duration. Reported in the same 422 format as Pydantic's, all at once.
-    Locks the video row (shared) first, so rallies can't change between this check
-    and the save (see crud.lock_video_for_reel_save)."""
+def check_edit_against_video(
+    session: Session, video: Video, edit: ReelEdit
+) -> ReelEdit:
+    """The checks Pydantic can't do alone, because they need the video: times past
+    its end, reported in the same 422 format as Pydantic's, all at once. Returns the
+    edit to store: rally labels that aren't (any more) the video's rallies become
+    null (they're labels; the footage still plays). Locks the video row (shared)
+    first, so rallies can't change until the save (crud.lock_video_for_reel_save)."""
     crud.lock_video_for_reel_save(session=session, video_id=video.id)
-    problems = edit.problems(
-        duration=video.duration,
-        rallies=crud.video_rally_bounds(session=session, video_id=video.id),
-    )
+    problems = edit.problems(duration=video.duration)
     if problems:
         session.rollback()
         raise RequestValidationError(
@@ -74,13 +73,14 @@ def check_edit_against_video(session: Session, video: Video, edit: ReelEdit) -> 
                 for loc, msg in problems
             ]
         )
+    known = set(crud.video_rally_bounds(session=session, video_id=video.id))
+    return edit.with_known_rallies(known)
 
 
 REEL_CHANGED = {
     "model": ErrorWithCode,
     "description": "code `reel_changed`: saved, created or deleted elsewhere (another "
-    "tab or device) since you loaded it, or adjusted to a rally correction or "
-    "re-analysis. Load it again.",
+    "tab or device) since you loaded it. Load it again.",
 }
 
 
@@ -118,7 +118,7 @@ def read_video_reel(
         raise CodedHTTPException(
             404, ErrorCode.REEL_MISSING, "This video has no reel yet"
         )
-    return reel
+    return crud.reel_public(session=session, reel=reel)
 
 
 @router.put(
@@ -139,26 +139,26 @@ def save_video_reel(
 ) -> Any:
     """
     Create or save the video's reel: replaces the title and the whole edit list
-    (clips without pieces are dropped, and restored anchors that are inside a piece,
-    or a second one in the same break). Send `updated_at: null` to create it (201),
+    (segment times are stored to 0.1 s; a rally_id that isn't one of the video's
+    rallies is stored as null). Send `updated_at: null` to create it (201),
     or the `updated_at` you loaded to update it (200). If it isn't as you last saw it
     (it now exists, changed, or was deleted), nothing is saved: 409, reload.
     The reel belongs to the video's owner, also when a superuser saves it.
     """
     video = get_video_for_user(session, current_user, id)
-    check_edit_against_video(session, video, reel_in.edit)
+    edit = check_edit_against_video(session, video, reel_in.edit)
     reel, created = crud.save_video_reel(
         session=session,
         video=video,
         title=reel_in.title,
-        edit=reel_in.edit,
+        edit=edit,
         expected_updated_at=reel_in.updated_at,
     )
     if reel is None:
         raise reel_changed()
     if created:
         response.status_code = 201
-    return reel
+    return crud.reel_public(session=session, reel=reel)
 
 
 # --- Deprecated: several reels per video, by reel id -----------------------------
@@ -181,7 +181,9 @@ def read_reels(
     reels, count = crud.list_reels(
         session=session, video_id=video.id, skip=skip, limit=limit
     )
-    return ReelsPublic(data=reels, count=count)  # type: ignore[arg-type]
+    return ReelsPublic(
+        data=[crud.reel_public(session=session, reel=r) for r in reels], count=count
+    )
 
 
 @router.post(
@@ -207,17 +209,17 @@ def create_reel(
     video = get_video_for_user(session, current_user, id)
     existing = crud.get_video_reel(session=session, video_id=id)
     if existing is None:
-        check_edit_against_video(session, video, reel_in.edit)
+        edit = check_edit_against_video(session, video, reel_in.edit)
         created = crud.create_reel(
-            session=session, video=video, title=reel_in.title, edit=reel_in.edit
+            session=session, video=video, title=reel_in.title, edit=edit
         )
         if created is not None:
-            return created
+            return crud.reel_public(session=session, reel=created)
         # Created by another request a moment ago
         existing = crud.get_video_reel(session=session, video_id=id)
         assert existing is not None
     response.status_code = 200
-    return existing
+    return crud.reel_public(session=session, reel=existing)
 
 
 @router.get("/reels/{reel_id}", response_model=ReelPublic, deprecated=True)
@@ -227,7 +229,8 @@ def read_reel(
     """
     Deprecated: use GET /videos/{id}/reel. Get a reel with its edit list.
     """
-    return get_reel_for_user(session, current_user, reel_id)
+    reel = get_reel_for_user(session, current_user, reel_id)
+    return crud.reel_public(session=session, reel=reel)
 
 
 @router.put(
@@ -249,21 +252,20 @@ def update_reel(
     reel = get_reel_for_user(session, current_user, reel_id)
     video = session.get(Video, reel.video_id)
     assert video  # reels go when their video is deleted (database cascade)
-    check_edit_against_video(session, video, reel_in.edit)
+    edit = check_edit_against_video(session, video, reel_in.edit)
     if not crud.update_reel(
         session=session,
         reel_id=reel_id,
         title=reel_in.title,
-        edit=reel_in.edit,
+        edit=edit,
         expected_updated_at=reel_in.updated_at,
-        duration=video.duration,
     ):
         session.expire_all()
         if crud.get_reel(session=session, reel_id=reel_id) is None:
             raise HTTPException(status_code=404, detail="Reel not found")
         raise reel_changed()
     session.refresh(reel)
-    return reel
+    return crud.reel_public(session=session, reel=reel)
 
 
 @router.delete("/reels/{reel_id}", response_model=Message, deprecated=True)
