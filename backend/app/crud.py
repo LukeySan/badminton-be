@@ -1108,6 +1108,59 @@ def create_export(
     return export, "created"
 
 
+RetryExportResult = Literal[
+    "queued", "not_failed", "expired", "already_active", "limit_reached"
+]
+
+
+def retry_export(
+    *, session: Session, export_id: uuid.UUID, max_active: int
+) -> RetryExportResult:
+    """Queue a failed export again, with the snapshot it was made with (edits made
+    since don't change it). Keeps created_at: the edit it shows, and when its file
+    expires, stay the same; an expired one can't be retried (export again instead).
+    Same rules as create_export, under the same lock on the owner's user row: one
+    active export per reel, max_active per owner."""
+    export = session.get(Export, export_id)
+    if export is None or export.deleted_at is not None:
+        return "not_failed"
+    session.exec(
+        select(User.id).where(col(User.id) == export.owner_id).with_for_update()
+    ).one()
+    session.refresh(export)  # the status may have changed while we waited
+    if export.status != "failed" or export.deleted_at is not None:
+        session.rollback()
+        return "not_failed"
+    if export_expires_at(export) <= get_datetime_utc():
+        session.rollback()
+        return "expired"
+    active_for_reel = session.exec(
+        select(Export.id).where(col(Export.reel_id) == export.reel_id, *_ACTIVE_EXPORT)
+    ).first()
+    if active_for_reel is not None:
+        session.rollback()
+        return "already_active"
+    active = session.exec(
+        select(func.count())
+        .select_from(Export)
+        .where(col(Export.owner_id) == export.owner_id, *_ACTIVE_EXPORT)
+    ).one()
+    if active >= max_active:
+        session.rollback()
+        return "limit_reached"
+    export.status = "queued"
+    export.progress = 0.0
+    export.failure_reason = None
+    export.error = None
+    export.attempts = 0
+    export.claim_id = None
+    export.claimed_by = None
+    export.updated_at = get_datetime_utc()
+    session.add(export)
+    session.commit()
+    return "queued"
+
+
 def export_public(export: Export) -> ExportPublic:
     width, height = EXPORT_SIZES[(export.format, export.quality)]
     snapshot = ExportSnapshot.model_validate(export.snapshot)

@@ -6,6 +6,7 @@ Reel exports: the video's reel rendered into an MP4 by the worker.
     GET  /exports/{id}                one export (poll this for status/progress)
     GET  /exports/{id}/download       signed link to the finished file
     GET  /exports/{id}/file?token=    the file, as an attachment
+    POST /exports/{id}/retry          queue a failed export again (same snapshot)
     DELETE /exports/{id}              soft delete (also stops a running render)
 
 What's rendered is fixed when the export is requested (the snapshot, see
@@ -178,6 +179,60 @@ def read_export(
     failure reason, size, and when its file will be deleted.
     """
     return crud.export_public(get_export_for_user(session, current_user, export_id))
+
+
+@router.post(
+    "/exports/{export_id}/retry",
+    response_model=ExportPublic,
+    responses={
+        409: {
+            "description": "Not failed (queued, processing or done), or another "
+            "export of this reel is already queued or processing"
+        },
+        410: {"description": "Expired: export the reel again instead"},
+        429: {"description": "Too many of your exports queued or processing"},
+    },
+)
+def retry_export(
+    session: SessionDep, current_user: CurrentUser, export_id: uuid.UUID
+) -> Any:
+    """
+    Queue a failed export again ("Try again"). It renders the same snapshot: what
+    the reel was when the export was requested, not what it is now. Keeps its
+    created_at and expires_at.
+    """
+    get_export_for_user(session, current_user, export_id)
+    result = crud.retry_export(
+        session=session,
+        export_id=export_id,
+        max_active=settings.MAX_ACTIVE_EXPORTS_PER_USER,
+    )
+    if result == "not_failed":
+        raise HTTPException(
+            status_code=409, detail="Only a failed export can be tried again"
+        )
+    if result == "expired":
+        raise HTTPException(
+            status_code=410,
+            detail="This export has expired; export the reel again instead",
+        )
+    if result == "already_active":
+        raise HTTPException(
+            status_code=409,
+            detail="This reel is already being exported; wait for that export to "
+            "finish",
+        )
+    if result == "limit_reached":
+        n = settings.MAX_ACTIVE_EXPORTS_PER_USER
+        raise HTTPException(
+            status_code=429,
+            detail=f"You already have {n} export{'s' if n != 1 else ''} queued or "
+            "processing; try again when one has finished",
+        )
+    export = crud.get_export(session=session, export_id=export_id)
+    assert export is not None
+    session.refresh(export)
+    return crud.export_public(export)
 
 
 @router.get(

@@ -523,3 +523,107 @@ def test_deleting_the_video_deletes_its_exports(
     db.expire_all()
     assert db.get(Export, uuid.UUID(export_id)) is None
     assert not (settings.STORAGE_DIR / str(video[0])).exists()
+
+
+# --- trying a failed export again ---------------------------------------------------
+
+
+def fail(db: Session, export_id: str) -> None:
+    """Mark the export failed, as the worker would."""
+    db.exec(
+        update(Export)
+        .where(col(Export.id) == uuid.UUID(export_id))
+        .values(
+            status="failed",
+            progress=0.4,
+            failure_reason="The export kept stopping",
+            error="ffmpeg died",
+            attempts=3,
+        )
+    )
+    db.commit()
+
+
+def test_retry_a_failed_export_renders_the_same_snapshot(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    h = normal_user_token_headers
+    save_reel(client, h, video[0], reel_edit(video[1]))
+    first = start_export(client, h, video[0]).json()
+    fail(db, first["id"])
+    # The reel changes after the export was requested
+    save_reel(client, h, video[0], {**reel_edit(video[1]), "format": "16:9"})
+
+    r = client.post(f"{API}/exports/{first['id']}/retry", headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert (body["status"], body["progress"], body["failure_reason"]) == (
+        "queued",
+        0.0,
+        None,
+    )
+    # Same export: same edit (format, length), same request time and expiry
+    for key in ("id", "format", "duration", "created_at", "expires_at"):
+        assert body[key] == first[key]
+    stored = db.get(Export, uuid.UUID(first["id"]))
+    assert stored
+    db.refresh(stored)
+    assert (stored.attempts, stored.error, stored.claim_id) == (0, None, None)
+
+
+def test_retry_refused(
+    client: TestClient,
+    db: Session,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+    other_user_headers: dict[str, str],
+) -> None:
+    h = normal_user_token_headers
+    save_reel(client, h, video[0], reel_edit(video[1]))
+    export_id = start_export(client, h, video[0]).json()["id"]
+    retry = f"{API}/exports/{export_id}/retry"
+
+    # Not failed (queued)
+    r = client.post(retry, headers=h)
+    assert r.status_code == 409
+    assert r.json()["detail"] == "Only a failed export can be tried again"
+    # Others don't see it
+    assert client.post(retry, headers=other_user_headers).status_code == 404
+
+    # Another export of the reel is running meanwhile
+    fail(db, export_id)
+    assert start_export(client, h, video[0]).status_code == 201
+    r = client.post(retry, headers=h)
+    assert r.status_code == 409
+    assert "already being exported" in r.json()["detail"]
+
+    # Expired
+    db.exec(delete(Export).where(col(Export.id) != uuid.UUID(export_id)))
+    db.exec(
+        update(Export)
+        .where(col(Export.id) == uuid.UUID(export_id))
+        .values(created_at=func.now() - timedelta(days=8))
+    )
+    db.commit()
+    assert client.post(retry, headers=h).status_code == 410
+
+
+def test_retry_counts_against_the_per_user_limit(
+    client: TestClient,
+    db: Session,
+    normal_user_token_headers: dict[str, str],
+) -> None:
+    h = normal_user_token_headers
+    video_id, rallies = make_video(db, settings.EMAIL_TEST_USER)
+    save_reel(client, h, video_id, reel_edit(rallies))
+    failed_id = start_export(client, h, video_id).json()["id"]
+    fail(db, failed_id)
+    for _ in range(settings.MAX_ACTIVE_EXPORTS_PER_USER):
+        other_video, other_rallies = make_video(db, settings.EMAIL_TEST_USER)
+        save_reel(client, h, other_video, reel_edit(other_rallies))
+        assert start_export(client, h, other_video).status_code == 201
+    r = client.post(f"{API}/exports/{failed_id}/retry", headers=h)
+    assert r.status_code == 429

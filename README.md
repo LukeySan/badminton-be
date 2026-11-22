@@ -143,6 +143,7 @@ own videos; the superuser sees all.
 | `GET /exports/{id}` | One export (poll for status/progress; `failure_reason` when failed) |
 | `GET /exports/{id}/download` | Signed link to the finished MP4 `{url, filename, expires_at}`; 409 not done, 410 expired |
 | `GET /exports/{id}/file?token=...` | The MP4 as an attachment (`Content-Disposition`), Range supported |
+| `POST /exports/{id}/retry` | Try a failed export again: the same snapshot (edits since don't change it), same `created_at` / `expires_at`. 409 not failed or this reel is already exporting; 410 expired; 429 like creating one |
 | `DELETE /exports/{id}` | Delete an export and its file (soft); stops a render in progress |
 | *deprecated* `GET /videos/{id}/reels`, `POST /videos/{id}/reels`, `GET`/`PUT`/`DELETE /reels/{id}` | The old several-reels-per-video API, kept until the frontend has switched. `POST` is now get-or-create: it returns the existing reel (200) instead of making a second one |
 | `GET /videos/{id}/file-url` | A temporary link (12 h) for playing the video |

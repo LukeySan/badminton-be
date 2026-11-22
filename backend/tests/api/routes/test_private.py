@@ -166,3 +166,98 @@ def test_set_analysis_unknown_video(client: TestClient) -> None:
         json={"rallies": []},
     )
     assert r.status_code == 404
+
+
+def _export_for_fixture_tests(
+    client: TestClient, db: Session, headers: dict[str, str]
+) -> str:
+    """The superuser's 3 s test-pattern video with a reel of one 0.5-2 s piece,
+    exported (queued)."""
+    owner = crud.get_user_by_email(session=db, email=settings.FIRST_SUPERUSER)
+    assert owner
+    video = Video(
+        owner_id=owner.id,
+        filename="export.mp4",
+        storage_path="pending",
+        status="uploaded",
+        duration=3.0,
+        fps=30.0,
+        width=320,
+        height=180,
+    )
+    db.add(video)
+    db.commit()
+    folder = settings.STORAGE_DIR / str(video.id)
+    folder.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "testsrc=duration=3:size=320x180:rate=30", "-pix_fmt", "yuv420p",
+         str(folder / "original.mp4")],
+        check=True,
+    )  # fmt: skip
+    video.storage_path = f"{video.id}/original.mp4"
+    db.add(video)
+    db.commit()
+    api = settings.API_V1_STR
+    client.post(
+        f"{api}/private/videos/{video.id}/analysis", json={"rallies": [[0.5, 2.0]]}
+    )
+    rally = client.get(f"{api}/videos/{video.id}/rallies", headers=headers).json()
+    edit = {
+        "lead_in": 0,
+        "lead_out": 0,
+        "clips": [
+            {
+                "rally_id": rally["data"][0]["id"],
+                "pieces": [{"start": 0.5, "end": 2.0}],
+            }
+        ],
+    }
+    r = client.put(
+        f"{api}/videos/{video.id}/reel",
+        headers=headers,
+        json={"title": "Fixture", "edit": edit, "updated_at": None},
+    )
+    assert r.status_code == 201, r.text
+    r = client.post(
+        f"{api}/videos/{video.id}/reel/exports", headers=headers, json={}
+    )
+    assert r.status_code == 201, r.text
+    return str(r.json()["id"])
+
+
+def test_export_state_fixture(
+    client: TestClient, superuser_token_headers: dict[str, str], db: Session
+) -> None:
+    export_id = _export_for_fixture_tests(client, db, superuser_token_headers)
+    url = f"{settings.API_V1_STR}/private/exports/{export_id}/state"
+    r = client.post(url, json={"status": "processing", "progress": 0.42})
+    assert (r.json()["status"], r.json()["progress"]) == ("processing", 0.42)
+    r = client.post(
+        url, json={"status": "failed", "failure_reason": "The export kept stopping"}
+    )
+    assert (r.json()["status"], r.json()["failure_reason"]) == (
+        "failed",
+        "The export kept stopping",
+    )
+    missing = f"{settings.API_V1_STR}/private/exports/{uuid.uuid4()}/state"
+    assert client.post(missing, json={"status": "failed"}).status_code == 404
+
+
+def test_export_render_fixture_makes_a_real_mp4(
+    client: TestClient, superuser_token_headers: dict[str, str], db: Session
+) -> None:
+    export_id = _export_for_fixture_tests(client, db, superuser_token_headers)
+    api = settings.API_V1_STR
+    r = client.post(f"{api}/private/exports/{export_id}/render")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "done"
+    assert body["size_bytes"] > 0
+    assert abs(body["duration"] - 1.5) < 0.2
+    link = client.get(
+        f"{api}/exports/{export_id}/download", headers=superuser_token_headers
+    ).json()
+    file = client.get(link["url"])
+    assert file.status_code == 200
+    assert file.headers["content-type"] == "video/mp4"
