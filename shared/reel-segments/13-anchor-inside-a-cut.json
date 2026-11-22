@@ -1,0 +1,88 @@
+{
+  "description": "Rally 1's middle 13-16 was deleted (a cut). An anchor inside it restores nothing: deleted footage never plays. The next save drops the anchor.",
+  "duration": 60,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 30,
+      "end": 40
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      14.5
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 13,
+            "slow_mo": false
+          },
+          {
+            "start": 16,
+            "end": 21,
+            "slow_mo": true
+          }
+        ],
+        "cuts": [
+          {
+            "start": 13,
+            "end": 16
+          }
+        ]
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 29,
+            "end": 41,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 13,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 16,
+        "end": 21,
+        "slow_mo": true
+      },
+      {
+        "kind": "piece",
+        "start": 29,
+        "end": 41,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 26
+  }
+}

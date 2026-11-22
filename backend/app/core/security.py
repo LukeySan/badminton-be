@@ -18,28 +18,37 @@ password_hash = PasswordHash(
 
 
 ALGORITHM = "HS256"
-FILE_TOKEN_SCOPE = "video-file"
+FILE_TOKEN_SCOPE = "video-file"  # a video's file and thumbnails
+EXPORT_FILE_SCOPE = "export-file"  # one exported reel's MP4
 
 
-def create_file_token(video_id: uuid.UUID) -> tuple[str, datetime]:
-    """Short-lived token that allows streaming one video's file.
+def create_file_token(
+    subject_id: uuid.UUID,
+    scope: str = FILE_TOKEN_SCOPE,
+    not_after: datetime | None = None,
+) -> tuple[str, datetime]:
+    """Short-lived token that allows fetching one video's (or export's) files.
 
     A <video src="..."> can't send the Authorization header, so the frontend gets
     a URL with this token instead of putting the (8-day) login token in a URL.
+    Tokens with a scope are never accepted as login tokens (deps.get_current_user).
+    not_after: expire no later than this (e.g. when an export's file is deleted).
     """
     expire = datetime.now(UTC) + timedelta(minutes=settings.FILE_TOKEN_EXPIRE_MINUTES)
-    to_encode = {"exp": expire, "sub": str(video_id), "scope": FILE_TOKEN_SCOPE}
+    if not_after is not None:
+        expire = min(expire, not_after)
+    to_encode = {"exp": expire, "sub": str(subject_id), "scope": scope}
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM), expire
 
 
-def verify_file_token(token: str, video_id: uuid.UUID) -> bool:
+def verify_file_token(
+    token: str, subject_id: uuid.UUID, scope: str = FILE_TOKEN_SCOPE
+) -> bool:
     try:
         payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
     except jwt.InvalidTokenError:
         return False
-    return bool(
-        payload.get("scope") == FILE_TOKEN_SCOPE and payload.get("sub") == str(video_id)
-    )
+    return bool(payload.get("scope") == scope and payload.get("sub") == str(subject_id))
 
 
 def create_access_token(subject: str | Any, expires_delta: timedelta) -> str:

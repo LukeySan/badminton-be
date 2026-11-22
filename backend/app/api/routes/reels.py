@@ -139,7 +139,8 @@ def save_video_reel(
 ) -> Any:
     """
     Create or save the video's reel: replaces the title and the whole edit list
-    (clips without pieces are dropped). Send `updated_at: null` to create it (201),
+    (clips without pieces are dropped, and restored anchors that are inside a piece,
+    or a second one in the same break). Send `updated_at: null` to create it (201),
     or the `updated_at` you loaded to update it (200). If it isn't as you last saw it
     (it now exists, changed, or was deleted), nothing is saved: 409, reload.
     The reel belongs to the video's owner, also when a superuser saves it.
@@ -255,6 +256,7 @@ def update_reel(
         title=reel_in.title,
         edit=reel_in.edit,
         expected_updated_at=reel_in.updated_at,
+        duration=video.duration,
     ):
         session.expire_all()
         if crud.get_reel(session=session, reel_id=reel_id) is None:

@@ -1,0 +1,78 @@
+{
+  "description": "The break was restored with 1 s leads (anchor 25). Then the leads went down to 0.5 s and the pieces shrank with them: the restored stretch grows with them to 20.5-29.5.",
+  "duration": 60,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 30,
+      "end": 40
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 0.5,
+    "lead_out": 0.5,
+    "restored_anchors": [
+      25
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9.5,
+            "end": 20.5,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 29.5,
+            "end": 40.5,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9.5,
+        "end": 20.5,
+        "slow_mo": false
+      },
+      {
+        "kind": "gap",
+        "start": 20.5,
+        "end": 29.5,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 29.5,
+        "end": 40.5,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 31
+  }
+}

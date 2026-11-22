@@ -61,7 +61,7 @@ def other_user_headers(client: TestClient, db: Session) -> dict[str, str]:
 def full_edit(rally_ids: list[int]) -> dict[str, Any]:
     """Rallies are 10-20 s and 30-45 s; pieces may go 1 s beyond (default lead)."""
     return {
-        "version": 2,
+        "version": 4,
         "view": "full",
         "format": "9:16",
         "lead_in": 1.0,
@@ -71,12 +71,12 @@ def full_edit(rally_ids: list[int]) -> dict[str, Any]:
                 {"start": 29.0, "end": 35.0, "slow_mo": False},
                 {"start": 35.0, "end": 38.0, "slow_mo": True},  # touching: a split
                 {"start": 41.0, "end": 47.5, "slow_mo": False},
-            ]},
+            ], "cuts": [{"start": 38.0, "end": 41.0}]},  # deleted between pieces
             {"rally_id": rally_ids[0], "pieces": [
                 {"start": 9.5, "end": 20.5, "slow_mo": False},
-            ]},
+            ], "cuts": []},
         ],
-        "restored_gaps": [{"start": 20.5, "end": 24.0}],
+        "restored_anchors": [22.25],  # between the pieces 9.5-20.5 and 29-35
         "overlays": {
             "trail": True,
             "captions": [{"text": "What a smash", "start": 40.0, "end": 43.0}],
@@ -89,7 +89,7 @@ def piece(start: float, end: float, slow_mo: bool = False) -> dict[str, Any]:
 
 
 def clip(rally_id: int, *pieces: dict[str, Any]) -> dict[str, Any]:
-    return {"rally_id": rally_id, "pieces": list(pieces)}
+    return {"rally_id": rally_id, "pieces": list(pieces), "cuts": []}
 
 
 CreateFn = Callable[..., dict[str, Any]]
@@ -144,13 +144,13 @@ def test_create_and_read_reel(
 def test_new_reel_gets_an_empty_edit_with_defaults(create: CreateFn) -> None:
     reel = create()
     assert reel["edit"] == {
-        "version": 2,
+        "version": 4,
         "view": "cut",
         "format": "16:9",
         "lead_in": 1.0,
         "lead_out": 1.0,
         "clips": [],
-        "restored_gaps": [],
+        "restored_anchors": [],
         "overlays": {"trail": False, "captions": []},
     }
 
@@ -231,7 +231,7 @@ def test_update_replaces_title_and_whole_edit(
     # Full replace: what wasn't sent is back to the defaults, not merged
     assert saved["edit"]["format"] == "16:9"
     assert saved["edit"]["lead_out"] == 1.0
-    assert saved["edit"]["restored_gaps"] == []
+    assert saved["edit"]["restored_anchors"] == []
     assert saved["edit"]["overlays"] == {"trail": False, "captions": []}
     assert saved["edit"]["clips"] == [clip(video[1][0], piece(10, 19))]
     assert when(saved["updated_at"]) > when(reel["updated_at"])
@@ -417,7 +417,9 @@ A, B = 0, 1  # index into the video's rally ids
         pytest.param({"clips": [[A, piece(12, 21.1)]]}, ["clips", 0, "pieces", 0, "end"], id="after-lead-out"),
         pytest.param({"lead_out": 3, "clips": [[A, piece(12, 23.1)]]}, ["clips", 0, "pieces", 0, "end"], id="after-max-lead-out"),
         pytest.param({"clips": [[A, piece(10, 11), piece(30, 31)]]}, ["clips", 0, "pieces", 1, "end"], id="piece-in-another-rally"),
-        pytest.param({"restored_gaps": [{"start": 110, "end": DURATION + 1}]}, ["restored_gaps", 0, "end"], id="gap-past-end"),
+        pytest.param({"restored_anchors": [DURATION + 1]}, ["restored_anchors", 0], id="anchor-past-end"),
+        pytest.param({"clips": [{"rally_index": A, "pieces": [piece(12, 14)], "cuts": [{"start": 14, "end": 21.5}]}]}, ["clips", 0, "cuts", 0, "end"], id="cut-after-lead-out"),
+        pytest.param({"clips": [{"rally_index": A, "pieces": [piece(12, 14)], "cuts": [{"start": 8, "end": 9}]}]}, ["clips", 0, "cuts", 0, "start"], id="cut-before-lead-in"),
         pytest.param({"overlays": {"captions": [{"text": "x", "start": 110, "end": DURATION + 1}]}}, ["overlays", "captions", 0, "end"], id="caption-past-end"),
         # Pydantic
         pytest.param({"clips": [[A, piece(12, 12)]]}, ["clips", 0, "pieces", 0], id="empty-piece"),
@@ -428,12 +430,16 @@ A, B = 0, 1  # index into the video's rally ids
         pytest.param({"clips": [{"rally_id": None, "pieces": []}]}, ["clips", 0, "rally_id"], id="rally-id-null"),
         pytest.param({"lead_in": 3.5}, ["lead_in"], id="lead-in-over-3"),
         pytest.param({"lead_out": -1}, ["lead_out"], id="negative-lead-out"),
-        pytest.param({"restored_gaps": [{"start": 5, "end": 4}]}, ["restored_gaps", 0], id="gap-backwards"),
+        pytest.param({"restored_anchors": [-1]}, ["restored_anchors", 0], id="negative-anchor"),
+        pytest.param({"clips": [{"rally_id": 1, "pieces": [], "cuts": [{"start": 5, "end": 4}]}]}, ["clips", 0, "cuts", 0], id="cut-backwards"),
+        pytest.param({"restored_gaps": [{"start": 4, "end": 5}]}, ["restored_gaps"], id="v2-restored-gaps"),
         pytest.param({"overlays": {"captions": [{"text": "x" * (CAPTION_MAX_LENGTH + 1), "start": 1, "end": 2}]}}, ["overlays", "captions", 0, "text"], id="caption-81-chars"),
         pytest.param({"overlays": {"captions": [{"text": "", "start": 1, "end": 2}]}}, ["overlays", "captions", 0, "text"], id="caption-empty"),
         pytest.param({"view": "split"}, ["view"], id="bad-view"),
         pytest.param({"format": "1:1"}, ["format"], id="bad-format"),
         pytest.param({"version": 1}, ["version"], id="old-version"),
+        pytest.param({"version": 2}, ["version"], id="v2"),
+        pytest.param({"version": 3}, ["version"], id="v3"),
         pytest.param({"clips": [{"rally_id": 1, "trim_start": 1, "trim_end": 2}]}, ["clips", 0, "trim_start"], id="v1-clip"),
         pytest.param({"clipz": []}, ["clipz"], id="unknown-field"),
         pytest.param({"clips": [[A, {**piece(11, 12), "speed": 0.5}]]}, ["clips", 0, "pieces", 0, "speed"], id="unknown-piece-field"),
@@ -446,9 +452,13 @@ def test_invalid_edit_is_rejected(
     edit: dict[str, Any],
     loc: list[str | int],
 ) -> None:
-    # [A, piece...] is shorthand for a clip of rally A
+    # [A, piece...] is shorthand for a clip of rally A; a dict may name its rally
+    # by index too ("rally_index": A)
     clips = [
-        clip(video[1][c[0]], *c[1:]) if isinstance(c, list) else c
+        clip(video[1][c[0]], *c[1:])
+        if isinstance(c, list)
+        else {k: v for k, v in c.items() if k != "rally_index"}
+        | ({"rally_id": video[1][c["rally_index"]]} if "rally_index" in c else {})
         for c in edit.get("clips", [])
     ]
     body = {**edit, "clips": clips} if "clips" in edit else edit
@@ -530,7 +540,7 @@ def test_limits_that_are_allowed(
             clip(b, piece(27, 48)),
             clip(a, piece(10, 20)),
         ],
-        "restored_gaps": [{"start": 0, "end": DURATION}],
+        "restored_anchors": [DURATION - 1],  # after the last piece
         "overlays": {"captions": [{"text": "x" * CAPTION_MAX_LENGTH, "start": 0, "end": DURATION}]},
     }  # fmt: skip
     reel = create(edit=edit)
@@ -599,5 +609,5 @@ def test_reel_rows_store_plain_json(
     """The edit list is a JSONB document with the version inside."""
     create(edit=full_edit(video[1]))
     row = db.exec(select(Reel).where(col(Reel.video_id) == video[0])).one()
-    assert row.edit["version"] == 2
+    assert row.edit["version"] == 4
     assert row.edit["clips"][0]["pieces"][1]["slow_mo"] is True

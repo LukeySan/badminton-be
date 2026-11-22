@@ -1,0 +1,117 @@
+{
+  "description": "Rally 1 is shown again in slow-mo after rally 2 (a replay, out of time order). Stretches are found between pieces sorted by time (the replay is inside rally 1's piece, so it changes nothing); the restored 41-49 goes right before rally 3, after the replay.",
+  "duration": 70,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 30,
+      "end": 40
+    },
+    {
+      "id": 3,
+      "start": 50,
+      "end": 60
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      45
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 21,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 29,
+            "end": 41,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 15,
+            "end": 18,
+            "slow_mo": true
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 3,
+        "pieces": [
+          {
+            "start": 49,
+            "end": 61,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 21,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 29,
+        "end": 41,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 15,
+        "end": 18,
+        "slow_mo": true
+      },
+      {
+        "kind": "gap",
+        "start": 41,
+        "end": 49,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 49,
+        "end": 61,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 50
+  }
+}

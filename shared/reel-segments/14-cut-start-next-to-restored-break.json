@@ -1,0 +1,83 @@
+{
+  "description": "Rally 2's first 3 s (29-32) were deleted, right after the restored break 21-29. The break plays up to the cut, the cut never: 21-29, then rally 2 from 32.",
+  "duration": 60,
+  "rallies": [
+    {
+      "id": 1,
+      "start": 10,
+      "end": 20
+    },
+    {
+      "id": 2,
+      "start": 30,
+      "end": 40
+    }
+  ],
+  "edit": {
+    "version": 4,
+    "view": "cut",
+    "format": "16:9",
+    "lead_in": 1,
+    "lead_out": 1,
+    "restored_anchors": [
+      25
+    ],
+    "overlays": {
+      "trail": false,
+      "captions": []
+    },
+    "clips": [
+      {
+        "rally_id": 1,
+        "pieces": [
+          {
+            "start": 9,
+            "end": 21,
+            "slow_mo": false
+          }
+        ],
+        "cuts": []
+      },
+      {
+        "rally_id": 2,
+        "pieces": [
+          {
+            "start": 32,
+            "end": 41,
+            "slow_mo": false
+          }
+        ],
+        "cuts": [
+          {
+            "start": 29,
+            "end": 32
+          }
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "segments": [
+      {
+        "kind": "piece",
+        "start": 9,
+        "end": 21,
+        "slow_mo": false
+      },
+      {
+        "kind": "gap",
+        "start": 21,
+        "end": 29,
+        "slow_mo": false
+      },
+      {
+        "kind": "piece",
+        "start": 32,
+        "end": 41,
+        "slow_mo": false
+      }
+    ],
+    "captions": [],
+    "duration": 29
+  }
+}

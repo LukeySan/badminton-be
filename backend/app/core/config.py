@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     MAX_UPLOAD_BYTES: int = 2_000_000_000  # 2 GB, decimal, as phones show file sizes
     MAX_VIDEO_MINUTES: float = 60
     MAX_ACTIVE_VIDEOS_PER_USER: int = 2  # queued or processing at the same time
+    MAX_ACTIVE_EXPORTS_PER_USER: int = 3  # reel exports queued or processing
+    # Exported MP4s are deleted this long after they were requested (app/purge.py)
+    EXPORT_RETENTION_DAYS: int = 7
+    # Segments (pieces + restored gaps) per export: ffmpeg opens the original once
+    # per segment (frame-accurate seeks), so this bounds the worker's memory
+    MAX_EXPORT_SEGMENTS: int = 200
 
     # Rally detector the worker uses for new and re-analyzed videos (worker/detector.py).
     # "v1" = the old rules, kept for comparison and rollback.

@@ -27,6 +27,8 @@ dev = [
     "ty>=0.0.25",
     "ruff<1.0.0,>=0.16.0",
     "coverage<8.0.0,>=7.4.3",
+    # The worker's export tests render captions (worker/caption_image.py)
+    "pillow>=11.0",
 ]
 
 [build-system]

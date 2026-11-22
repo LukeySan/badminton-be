@@ -1,5 +1,6 @@
 import itertools
 import re
+import unicodedata
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from pydantic import (
     model_validator,
 )
 from pydantic import Field as PydanticField
-from sqlalchemy import Column, DateTime, Index, Text, text
+from sqlalchemy import BigInteger, Column, DateTime, Index, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -464,7 +465,7 @@ class TrajectoryPublic(SQLModel):
 
 REEL_TITLE_MAX_LENGTH = 100
 CAPTION_MAX_LENGTH = 80
-MAX_REEL_ITEMS = 500  # clips / restored gaps / captions per reel
+MAX_REEL_ITEMS = 500  # clips / restored anchors / captions per reel
 # The app's player may report a slightly different duration than ffprobe did
 TRIM_TOLERANCE = 0.1  # seconds
 MAX_LEAD = 3.0  # lead_in / lead_out: how far pieces may go past a rally's bounds
@@ -505,6 +506,15 @@ class ReelClip(EditModel):
         "reel's lead_in/lead_out. A clip without pieces is dropped when saved.",
     )
 
+    cuts: list[TimeRange] = PydanticField(
+        default=[],
+        max_length=MAX_REEL_ITEMS,
+        description="Footage of this clip the user deleted: never played, not even "
+        "in a restored break next to it, and a restored break stops at a cut. Same "
+        "bounds as pieces. Putting a cut back removes it from here and adds it to "
+        "the pieces. On save: sorted, merged, and what the pieces cover removed.",
+    )
+
     @model_validator(mode="after")
     def check_pieces(self) -> Self:
         for before, after in itertools.pairwise(self.pieces):
@@ -523,16 +533,23 @@ class ReelOverlays(EditModel):
 
 
 Lead = Annotated[float, PydanticField(ge=0, le=MAX_LEAD)]
+ReelFormat = Literal["16:9", "9:16"]
+
+
+Anchor = Annotated[float, PydanticField(ge=0)]
 
 
 class ReelEdit(EditModel):
     """The edit list, stored as JSON. `version` changes when the format does; an
     Alembic migration converts stored reels, so the code only knows the current one.
-    v2 (this): clips are rallies cut into pieces. v1 had one trim per clip."""
+    v4 (this): clips record deleted footage as cuts, which never play and bound
+    restored breaks. v3 made a restored break an anchor (one time inside it) so it
+    follows its neighbouring pieces; v2 stored restored breaks as {start, end}
+    ranges; v1 had one trim per clip instead of pieces."""
 
-    version: Literal[2] = 2
+    version: Literal[4] = 4
     view: Literal["cut", "full"] = "cut"
-    format: Literal["16:9", "9:16"] = "16:9"
+    format: ReelFormat = "16:9"
     lead_in: Lead = PydanticField(
         default=DEFAULT_LEAD,
         description="Seconds a piece may start before its rally's detected start "
@@ -545,10 +562,15 @@ class ReelEdit(EditModel):
     clips: list[ReelClip] = PydanticField(
         default=[], max_length=MAX_REEL_ITEMS, description="In reel order"
     )
-    restored_gaps: list[TimeRange] = PydanticField(
+    restored_anchors: list[Anchor] = PydanticField(
         default=[],
         max_length=MAX_REEL_ITEMS,
-        description="Breaks between rallies shown again in cut view",
+        description="Breaks shown again in 'Rallies only' (and exported): a stretch of "
+        "footage between the nearest piece or cut on each side (or the start / end of "
+        "the video) plays if one of these times (seconds) is inside it. Cuts never "
+        "play. An anchor inside a piece or a cut does nothing, and is dropped when the "
+        "reel is saved (so is a second anchor in the same stretch). See "
+        "app/reel_ops.py stretches.",
     )
     overlays: ReelOverlays = PydanticField(default_factory=ReelOverlays)
 
@@ -574,16 +596,17 @@ class ReelEdit(EditModel):
                 f"must be within the rally ({bounds[0]:.2f}-{bounds[1]:.2f} s) "
                 f"widened by lead_in/lead_out ({max(lo, 0):.2f}-{hi:.2f} s)"
             )
-            for j, piece in enumerate(clip.pieces):
-                if piece.start < lo - BOUND_TOLERANCE:
-                    found.append((("clips", i, "pieces", j, "start"), outside))
-                if piece.end > hi + BOUND_TOLERANCE:
-                    found.append((("clips", i, "pieces", j, "end"), outside))
-                elif limit is not None and piece.end > limit:
-                    found.append((("clips", i, "pieces", j, "end"), past_end))
-        for i, gap in enumerate(self.restored_gaps):
-            if limit is not None and gap.end > limit:
-                found.append((("restored_gaps", i, "end"), past_end))
+            for kind, ranges in (("pieces", clip.pieces), ("cuts", clip.cuts)):
+                for j, piece in enumerate(ranges):
+                    if piece.start < lo - BOUND_TOLERANCE:
+                        found.append((("clips", i, kind, j, "start"), outside))
+                    if piece.end > hi + BOUND_TOLERANCE:
+                        found.append((("clips", i, kind, j, "end"), outside))
+                    elif limit is not None and piece.end > limit:
+                        found.append((("clips", i, kind, j, "end"), past_end))
+        for i, anchor in enumerate(self.restored_anchors):
+            if limit is not None and anchor > limit:
+                found.append((("restored_anchors", i), past_end))
         for i, caption in enumerate(self.overlays.captions):
             if limit is not None and caption.end > limit:
                 found.append((("overlays", "captions", i, "end"), past_end))
@@ -673,6 +696,174 @@ class ReelPublic(SQLModel):
 class ReelsPublic(SQLModel):
     data: list[ReelPublic]
     count: int
+
+
+# ---------------------------------------------------------------------------
+# Exports: a reel rendered into an MP4 by the worker (worker/reel_export.py).
+# What to render is resolved when the export is requested and stored with it (the
+# snapshot, app/export_snapshot.py), so later reel edits or rally fixes don't change
+# an export that is queued or running.
+# ---------------------------------------------------------------------------
+
+ExportStatus = Literal["queued", "processing", "done", "failed"]
+ExportQuality = Literal["720p", "1080p"]
+# Output size per format and quality (width, height)
+EXPORT_SIZES: dict[tuple[str, str], tuple[int, int]] = {
+    ("16:9", "720p"): (1280, 720),
+    ("16:9", "1080p"): (1920, 1080),
+    ("9:16", "720p"): (720, 1280),
+    ("9:16", "1080p"): (1080, 1920),
+}
+
+
+class ExportFailureReason(StrEnum):
+    """Why an export failed, in words for the user (details stay in Export.error)."""
+
+    SOURCE_UNREADABLE = "Couldn't read the original video"
+    KEPT_STOPPING = "The export kept stopping"
+    UNKNOWN = "Something went wrong while exporting this reel"
+
+
+class ExportSegment(BaseModel):
+    """One stretch of the original video, in output order."""
+
+    kind: Literal["piece", "gap"] = PydanticField(
+        description="piece: part of a clip; gap: a restored break (normal speed)"
+    )
+    start: float = PydanticField(description="Seconds in the original video")
+    end: float
+    slow_mo: bool = PydanticField(default=False, description="Played at half speed")
+
+
+class ExportCaption(BaseModel):
+    text: str
+    start: float = PydanticField(description="Seconds in the exported video")
+    end: float
+
+
+class ExportSnapshot(BaseModel):
+    """Everything the worker needs to render, with absolute times (stored as JSON)."""
+
+    version: Literal[1] = 1
+    format: ReelFormat
+    segments: list[ExportSegment]
+    captions: list[ExportCaption]
+    duration: float = PydanticField(description="Expected output length, seconds")
+
+
+class Export(SQLModel, table=True):
+    """At most one queued/processing export per reel: a partial unique index, so two
+    clicks on "Export" can't both queue one."""
+
+    __table_args__ = (
+        Index(
+            "uq_export_reel_id_active",
+            "reel_id",
+            unique=True,
+            postgresql_where=text(
+                "status IN ('queued', 'processing') AND deleted_at IS NULL"
+            ),
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    video_id: uuid.UUID = Field(
+        foreign_key="video.id", nullable=False, ondelete="CASCADE", index=True
+    )
+    reel_id: uuid.UUID = Field(
+        foreign_key="reel.id", nullable=False, ondelete="CASCADE", index=True
+    )
+    # The video's owner, like reels (also when a superuser requested it)
+    owner_id: uuid.UUID = Field(
+        foreign_key="user.id", nullable=False, ondelete="CASCADE", index=True
+    )
+    title: str = Field(max_length=REEL_TITLE_MAX_LENGTH)  # the reel's, when requested
+    status: str = Field(default="queued", max_length=20, index=True)  # ExportStatus
+    progress: float = 0.0
+    format: str = Field(max_length=10)  # ReelFormat
+    quality: str = Field(max_length=10)  # ExportQuality
+    snapshot: dict[str, Any] = Field(sa_column=Column(JSONB, nullable=False))
+    # The finished file: relative to settings.STORAGE_DIR; null until done, and again
+    # once the purge (or DELETE) has removed the file
+    output_path: str | None = Field(default=None, max_length=255)
+    size_bytes: int | None = Field(default=None, sa_type=BigInteger)
+    duration: float | None = None  # measured on the finished file
+    failure_reason: str | None = Field(default=None, max_length=255)
+    error: str | None = Field(default=None, sa_type=Text)
+    # Worker bookkeeping, as for videos (see crud's worker job functions)
+    claim_id: uuid.UUID | None = None
+    claimed_by: str | None = Field(default=None, max_length=255)
+    attempts: int = Field(default=0, sa_column_kwargs={"server_default": "0"})
+    created_at: datetime = Field(
+        default_factory=get_datetime_utc, sa_type=DateTime(timezone=True)
+    )
+    # Queue time, then the worker's heartbeat (database clock)
+    updated_at: datetime = Field(
+        default_factory=get_datetime_utc, sa_type=DateTime(timezone=True)
+    )
+    deleted_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+def export_filename(title: str) -> str:
+    """'Saturday doubles' -> 'saturday-doubles-highlight.mp4'. Letters of any script
+    are kept (with their combining marks, e.g. Thai vowels); everything else becomes
+    a dash. A title that already ends in "highlight(s)" gets no second one."""
+    slug = "".join(
+        ch if unicodedata.category(ch)[0] in "LMN" else "-" for ch in title.lower()
+    )
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")[:80].strip("-")
+    if not slug:
+        return "highlight.mp4"
+    if re.search(r"(^|-)highlights?$", slug):
+        return f"{slug}.mp4"
+    return f"{slug}-highlight.mp4"
+
+
+class ExportCreate(SQLModel):
+    quality: ExportQuality = Field(
+        default="720p", description="1080p only if the video is at least 1080p"
+    )
+    format: ReelFormat | None = Field(
+        default=None, description="null: the reel's format"
+    )
+
+
+class ExportPublic(SQLModel):
+    id: uuid.UUID
+    video_id: uuid.UUID
+    reel_id: uuid.UUID
+    title: str
+    status: ExportStatus
+    progress: float
+    failure_reason: ExportFailureReason | None = Field(
+        description="Why it failed, for the user (only when status is 'failed')"
+    )
+    format: ReelFormat
+    quality: ExportQuality
+    width: int
+    height: int
+    duration: float = Field(
+        description="Length in seconds: expected until done, then measured"
+    )
+    size_bytes: int | None = Field(description="File size once done")
+    filename: str = Field(description="Name the download is saved as")
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime = Field(
+        description="When the file is deleted (created_at + 7 days)"
+    )
+
+
+class ExportsPublic(SQLModel):
+    data: list[ExportPublic]
+    count: int
+
+
+class ExportDownload(SQLModel):
+    url: str = Field(description="Signed link (relative to the API host); the "
+                     "response is an attachment named `filename`")  # fmt: skip
+    filename: str
+    expires_at: datetime
 
 
 class Health(SQLModel):
