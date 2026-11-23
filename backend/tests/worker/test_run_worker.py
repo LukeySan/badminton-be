@@ -472,17 +472,19 @@ def test_processor_without_a_trajectory_still_finishes(
 # --- a failing job never stops the worker ----------------------------------------
 
 
-def stop_when_idle(monkeypatch: pytest.MonkeyPatch, idle_polls: int = 1) -> None:
-    """End serve_forever like Ctrl+C at the `idle_polls`-th wait for new jobs."""
+def stop_when_idle(idle_polls: int = 1) -> Callable[[float], None]:
+    """A `wait` for serve_forever that ends it like Ctrl+C at the `idle_polls`-th
+    wait for new jobs. Not a patched time.sleep: subprocess sleeps while it waits
+    for ffmpeg/ffprobe (with a timeout), which would stop a render half-way."""
     polls = 0
 
-    def sleep(_seconds: float) -> None:
+    def wait(_seconds: float) -> None:
         nonlocal polls
         polls += 1
         if polls >= idle_polls:
             raise KeyboardInterrupt
 
-    monkeypatch.setattr(time, "sleep", sleep)  # what run_worker waits with
+    return wait
 
 
 def serve(engine: Engine, processor: run_worker.Processor, **kwargs: Any) -> None:
@@ -499,7 +501,6 @@ def serve(engine: Engine, processor: run_worker.Processor, **kwargs: Any) -> Non
 def test_worker_survives_a_failing_detection(
     db: Session,
     engine: Engine,
-    monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Detection raising fails that one video (short reason for the user, details
@@ -519,9 +520,8 @@ def test_worker_survives_a_failing_detection(
             raise TypeError("string indices must be integers, not 'str'")
         return detection({"start": 1.0, "end": 4.0})
 
-    stop_when_idle(monkeypatch)
     caplog.set_level("INFO", logger="worker")
-    serve(engine, processor)
+    serve(engine, processor, wait=stop_when_idle())
 
     failed = fetch(engine, broken)
     assert (failed.status, failed.claim_id) == ("failed", None)
@@ -657,9 +657,11 @@ def test_loop_survives_an_error_outside_any_job(
         return real_claim(**kwargs)
 
     monkeypatch.setattr(crud, "claim_next_video", claim_next_video)
-    stop_when_idle(monkeypatch, idle_polls=2)  # 1st poll: after the error
     caplog.set_level("INFO", logger="worker")
-    serve(engine, lambda *_: detection({"start": 1.0, "end": 2.0}))
+    # 1st poll: after the error; 2nd: idle
+    serve(
+        engine, lambda *_: detection({"start": 1.0, "end": 2.0}), wait=stop_when_idle(2)
+    )
 
     assert fetch(engine, video_id).status == "done"
     [error] = [r for r in caplog.records if "Unexpected error" in r.getMessage()]
@@ -672,3 +674,20 @@ def test_once_stops_after_one_job(db: Session, engine: Engine) -> None:
     serve(engine, lambda *_: detection(), once=True)
     assert fetch(engine, first).status == "done"
     assert fetch(engine, second).status == "queued"
+
+
+def test_sleeping_inside_a_job_doesnt_stop_the_loop(
+    db: Session, engine: Engine
+) -> None:
+    """subprocess sleeps while it waits for ffmpeg/ffprobe with a timeout (on Linux);
+    the loop's own wait is separate, so a job that sleeps still finishes. (CI caught
+    the old tests patching time.sleep: a render was stopped half-way as if by
+    Ctrl+C.)"""
+    video_id = make_video(db)
+
+    def processor(*_: Any) -> run_worker.Detection:
+        time.sleep(0.01)
+        return detection({"start": 1.0, "end": 2.0})
+
+    serve(engine, processor, wait=stop_when_idle())
+    assert fetch(engine, video_id).status == "done"
