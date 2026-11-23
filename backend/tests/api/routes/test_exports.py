@@ -54,8 +54,15 @@ def set_size(db: Session, video_id: uuid.UUID, width: int, height: int) -> None:
     db.commit()
 
 
-def piece(start: float, end: float, slow_mo: bool = False) -> dict[str, Any]:
-    return {"start": start, "end": end, "slow_mo": slow_mo}
+def seg(
+    id: str,
+    start: float,
+    end: float,
+    slow_mo: bool = False,
+    rally_id: int | None = None,
+) -> dict[str, Any]:
+    return {"id": id, "start": start, "end": end, "slow_mo": slow_mo,
+            "rally_id": rally_id}  # fmt: skip
 
 
 def save_reel(
@@ -80,12 +87,13 @@ def reel_edit(rallies: list[int]) -> dict[str, Any]:
     a, b = rallies
     return {
         "format": "9:16",
-        "clips": [
-            {"rally_id": a, "pieces": [piece(9, 15), piece(15, 18, slow_mo=True)]},
-            {"rally_id": b, "pieces": [piece(29, 46)]},
+        "segments": [
+            seg("a1", 9, 15, rally_id=a),
+            seg("a2", 15, 18, slow_mo=True, rally_id=a),
+            seg("break", 18, 29),  # footage between the rallies
+            seg("b", 29, 46, rally_id=b),
         ],
-        "restored_anchors": [23],  # the hidden 18-29 between rally 1's and 2's pieces
-        "overlays": {"captions": [{"text": "สุดยอด!", "start": 12, "end": 16}]},
+        "captions": [{"text": "สุดยอด!", "start": 12, "end": 16}],
     }
 
 
@@ -151,7 +159,7 @@ def test_create_export(
         720,
         1280,
     )
-    # 6 + 3 * 2 (slow-mo) + 11 (restored break 18-29) + 17 seconds
+    # 6 + 3 * 2 (slow-mo) + 11 (the break 18-29) + 17 seconds
     assert body["duration"] == 40.0
     assert body["size_bytes"] is None
     assert body["filename"] == "saturday-doubles-highlight.mp4"
@@ -161,12 +169,8 @@ def test_create_export(
     stored = db.get(Export, uuid.UUID(body["id"]))
     assert stored
     db.refresh(stored)
-    assert [s["kind"] for s in stored.snapshot["segments"]] == [
-        "piece",
-        "piece",
-        "gap",
-        "piece",
-    ]
+    a, b = video[1]
+    assert [s["rally_id"] for s in stored.snapshot["segments"]] == [a, a, None, b]
     assert stored.snapshot["captions"] == [{"text": "สุดยอด!", "start": 3.0, "end": 8.0}]
 
 
@@ -214,8 +218,8 @@ def test_no_reel_or_no_pieces(
     r = start_export(client, h, video[0])
     assert r.status_code == 404
     assert r.json()["code"] == "reel_missing"
-    # Restored breaks alone aren't something to export
-    save_reel(client, h, video[0], {"restored_anchors": [5]})
+    # An empty reel isn't something to export
+    save_reel(client, h, video[0], {})
     r = start_export(client, h, video[0])
     assert r.status_code == 409
     assert r.json()["detail"] == "The reel has no clips yet; add some to export it"
@@ -258,19 +262,6 @@ def test_per_user_limit(
     )
 
 
-def test_too_many_segments(
-    client: TestClient,
-    video: tuple[uuid.UUID, list[int]],
-    normal_user_token_headers: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(settings, "MAX_EXPORT_SEGMENTS", 3)
-    save_reel(client, normal_user_token_headers, video[0], reel_edit(video[1]))
-    r = start_export(client, normal_user_token_headers, video[0])
-    assert r.status_code == 422
-    assert "4 pieces and breaks" in r.json()["detail"]
-
-
 def test_snapshot_unaffected_by_later_edits_and_rally_fixes(
     client: TestClient,
     db: Session,
@@ -278,7 +269,7 @@ def test_snapshot_unaffected_by_later_edits_and_rally_fixes(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     """What's rendered is fixed at request time: the queued export keeps it while
-    the user re-edits the reel and fixes a rally (which retargets the reel)."""
+    the user re-edits the reel and fixes a rally."""
     h = normal_user_token_headers
     save_reel(client, h, video[0], reel_edit(video[1]))
     body = start_export(client, h, video[0]).json()
@@ -287,12 +278,11 @@ def test_snapshot_unaffected_by_later_edits_and_rally_fixes(
     snapshot_before = dict(stored.snapshot)
 
     a, b = video[1]
-    save_reel(client, h, video[0], {"clips": [{"rally_id": b, "pieces": [piece(30, 31)]}]},
+    save_reel(client, h, video[0], {"segments": [seg("b", 30, 31, rally_id=b)]},
               title="Renamed")  # fmt: skip
     r = client.put(f"{API}/videos/{video[0]}/rallies/{b}", headers=h,
                    json={"start": 32, "end": 40})  # fmt: skip
     assert r.status_code == 200, r.text
-    assert r.json()["reels"], "the rally fix should have adjusted the reel"
 
     db.refresh(stored)
     assert stored.snapshot == snapshot_before

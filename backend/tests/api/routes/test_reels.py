@@ -9,7 +9,16 @@ from sqlmodel import Session, col, select
 
 from app import crud
 from app.core.config import settings
-from app.models import CAPTION_MAX_LENGTH, Rally, Reel, UserCreate, Video
+from app.models import (
+    CAPTION_MAX_LENGTH,
+    MAX_REEL_SEGMENTS,
+    SEGMENT_ID_MAX_LENGTH,
+    Rally,
+    Reel,
+    ReelEdit,
+    UserCreate,
+    Video,
+)
 from tests.utils.user import user_authentication_headers
 from tests.utils.utils import random_email, random_lower_string
 
@@ -59,37 +68,33 @@ def other_user_headers(client: TestClient, db: Session) -> dict[str, str]:
 
 
 def full_edit(rally_ids: list[int]) -> dict[str, Any]:
-    """Rallies are 10-20 s and 30-45 s; pieces may go 1 s beyond (default lead)."""
+    """Rallies are 10-20 s and 30-45 s. Segments in playback order: rally 2, then
+    rally 1 in two parts (the second slow), a replay of part of rally 2, and footage
+    from outside the rallies."""
+    a, b = rally_ids
     return {
-        "version": 4,
-        "view": "full",
+        "version": 5,
         "format": "9:16",
-        "lead_in": 1.0,
-        "lead_out": 2.5,
-        "clips": [
-            {"rally_id": rally_ids[1], "pieces": [
-                {"start": 29.0, "end": 35.0, "slow_mo": False},
-                {"start": 35.0, "end": 38.0, "slow_mo": True},  # touching: a split
-                {"start": 41.0, "end": 47.5, "slow_mo": False},
-            ], "cuts": [{"start": 38.0, "end": 41.0}]},  # deleted between pieces
-            {"rally_id": rally_ids[0], "pieces": [
-                {"start": 9.5, "end": 20.5, "slow_mo": False},
-            ], "cuts": []},
+        "segments": [
+            seg("b", 29.0, 46.0, rally_id=b),
+            seg("a1", 9.0, 15.0, rally_id=a),
+            seg("a2", 15.0, 21.0, slow_mo=True, rally_id=a),
+            seg("b-replay", 40.0, 43.0, slow_mo=True, rally_id=b),
+            seg("crowd", 50.0, 54.5),
         ],
-        "restored_anchors": [22.25],  # between the pieces 9.5-20.5 and 29-35
-        "overlays": {
-            "trail": True,
-            "captions": [{"text": "What a smash", "start": 40.0, "end": 43.0}],
-        },
-    }  # fmt: skip
+        "captions": [{"text": "What a smash", "start": 40.0, "end": 43.0}],
+    }
 
 
-def piece(start: float, end: float, slow_mo: bool = False) -> dict[str, Any]:
-    return {"start": start, "end": end, "slow_mo": slow_mo}
-
-
-def clip(rally_id: int, *pieces: dict[str, Any]) -> dict[str, Any]:
-    return {"rally_id": rally_id, "pieces": list(pieces), "cuts": []}
+def seg(
+    id: str,
+    start: float,
+    end: float,
+    slow_mo: bool = False,
+    rally_id: int | None = None,
+) -> dict[str, Any]:
+    return {"id": id, "start": start, "end": end, "slow_mo": slow_mo,
+            "rally_id": rally_id}  # fmt: skip
 
 
 CreateFn = Callable[..., dict[str, Any]]
@@ -133,7 +138,7 @@ def test_create_and_read_reel(
     reel = create(edit=edit)
     assert reel["title"] == "Best rallies"
     assert reel["video_id"] == str(video_id)
-    assert reel["edit"] == edit  # stored exactly, clips in reel order
+    assert reel["edit"] == edit  # stored exactly, in playback order
     assert reel["created_at"] == reel["updated_at"]
 
     r = client.get(f"{API}/reels/{reel['id']}", headers=normal_user_token_headers)
@@ -144,25 +149,28 @@ def test_create_and_read_reel(
 def test_new_reel_gets_an_empty_edit_with_defaults(create: CreateFn) -> None:
     reel = create()
     assert reel["edit"] == {
-        "version": 4,
-        "view": "cut",
+        "version": 5,
         "format": "16:9",
-        "lead_in": 1.0,
-        "lead_out": 1.0,
-        "clips": [],
-        "restored_anchors": [],
-        "overlays": {"trail": False, "captions": []},
+        "segments": [],
+        "captions": [],
     }
 
 
-def test_clips_without_pieces_are_dropped(
-    create: CreateFn, video: tuple[uuid.UUID, list[int]]
+def test_times_are_stored_to_tenths(create: CreateFn) -> None:
+    """0.1 s precision: the app may send JavaScript's 12.300000000000001."""
+    reel = create(edit={"segments": [seg("a", 12.300000000000001, 14.04)]})
+    assert reel["edit"]["segments"] == [seg("a", 12.3, 14.0)]
+
+
+def test_labels_of_other_videos_rallies_are_stored_as_null(
+    db: Session, create: CreateFn, video: tuple[uuid.UUID, list[int]]
 ) -> None:
-    """Deleting a clip's last piece in the editor leaves an empty clip: the save
-    drops it, so stored reels never have empty clips."""
-    a, b = video[1]
-    reel = create(edit={"clips": [clip(b), clip(a, piece(10, 12)), clip(b)]})
-    assert reel["edit"]["clips"] == [clip(a, piece(10, 12))]
+    """rally_id is a label, never a reason to refuse a save."""
+    _, other_rallies = make_video(db, settings.EMAIL_TEST_USER)
+    a, _ = video[1]
+    reel = create(edit={"segments": [seg("x", 1, 2, rally_id=other_rallies[0]),
+                                     seg("y", 10, 12, rally_id=a)]})  # fmt: skip
+    assert [s["rally_id"] for s in reel["edit"]["segments"]] == [None, a]
 
 
 def test_reel_belongs_to_the_video_owner_even_when_a_superuser_makes_it(
@@ -219,7 +227,7 @@ def test_update_replaces_title_and_whole_edit(
     create: CreateFn,
 ) -> None:
     reel = create(edit=full_edit(video[1]))
-    new_edit = {"view": "cut", "clips": [clip(video[1][0], piece(10, 19))]}
+    new_edit = {"segments": [seg("only", 10, 19, rally_id=video[1][0])]}
     r = client.put(
         f"{API}/reels/{reel['id']}",
         headers=normal_user_token_headers,
@@ -230,10 +238,8 @@ def test_update_replaces_title_and_whole_edit(
     assert saved["title"] == "Renamed"
     # Full replace: what wasn't sent is back to the defaults, not merged
     assert saved["edit"]["format"] == "16:9"
-    assert saved["edit"]["lead_out"] == 1.0
-    assert saved["edit"]["restored_anchors"] == []
-    assert saved["edit"]["overlays"] == {"trail": False, "captions": []}
-    assert saved["edit"]["clips"] == [clip(video[1][0], piece(10, 19))]
+    assert saved["edit"]["captions"] == []
+    assert saved["edit"]["segments"] == [seg("only", 10, 19, rally_id=video[1][0])]
     assert when(saved["updated_at"]) > when(reel["updated_at"])
     assert saved["created_at"] == reel["created_at"]
 
@@ -403,46 +409,41 @@ def test_missing_reel_and_video(
 
 
 # --- validation -------------------------------------------------------------
-# The video is 120 s; rally A is 10-20 s, rally B 30-45 s; default lead 1 s.
+# The video is 120 s; rally A is 10-20 s, rally B 30-45 s.
 
-A, B = 0, 1  # index into the video's rally ids
+
+def many(n: int, length: float = 0.5) -> list[dict[str, Any]]:
+    return [seg(f"s{i}", 1.0, 1.0 + length) for i in range(n)]
 
 
 @pytest.mark.parametrize(
     ("edit", "loc"),
     [
         # Checked against the video
-        pytest.param({"clips": [{"rally_id": 999_999_999, "pieces": [piece(10, 12)]}]}, ["clips", 0, "rally_id"], id="unknown-rally"),
-        pytest.param({"clips": [[A, piece(8.9, 12)]]}, ["clips", 0, "pieces", 0, "start"], id="before-lead-in"),
-        pytest.param({"clips": [[A, piece(12, 21.1)]]}, ["clips", 0, "pieces", 0, "end"], id="after-lead-out"),
-        pytest.param({"lead_out": 3, "clips": [[A, piece(12, 23.1)]]}, ["clips", 0, "pieces", 0, "end"], id="after-max-lead-out"),
-        pytest.param({"clips": [[A, piece(10, 11), piece(30, 31)]]}, ["clips", 0, "pieces", 1, "end"], id="piece-in-another-rally"),
-        pytest.param({"restored_anchors": [DURATION + 1]}, ["restored_anchors", 0], id="anchor-past-end"),
-        pytest.param({"clips": [{"rally_index": A, "pieces": [piece(12, 14)], "cuts": [{"start": 14, "end": 21.5}]}]}, ["clips", 0, "cuts", 0, "end"], id="cut-after-lead-out"),
-        pytest.param({"clips": [{"rally_index": A, "pieces": [piece(12, 14)], "cuts": [{"start": 8, "end": 9}]}]}, ["clips", 0, "cuts", 0, "start"], id="cut-before-lead-in"),
-        pytest.param({"overlays": {"captions": [{"text": "x", "start": 110, "end": DURATION + 1}]}}, ["overlays", "captions", 0, "end"], id="caption-past-end"),
+        pytest.param({"segments": [seg("a", 110, DURATION + 0.2)]}, ["segments", 0, "end"], id="segment-past-end"),
+        pytest.param({"captions": [{"text": "x", "start": 110, "end": DURATION + 1}]}, ["captions", 0, "end"], id="caption-past-end"),
         # Pydantic
-        pytest.param({"clips": [[A, piece(12, 12)]]}, ["clips", 0, "pieces", 0], id="empty-piece"),
-        pytest.param({"clips": [[A, piece(14, 12)]]}, ["clips", 0, "pieces", 0], id="piece-backwards"),
-        pytest.param({"clips": [[A, piece(14, 16), piece(11, 12)]]}, ["clips", 0], id="pieces-unsorted"),
-        pytest.param({"clips": [[A, piece(11, 15), piece(14, 16)]]}, ["clips", 0], id="pieces-overlap"),
-        pytest.param({"clips": [{"pieces": []}]}, ["clips", 0, "rally_id"], id="rally-id-required"),
-        pytest.param({"clips": [{"rally_id": None, "pieces": []}]}, ["clips", 0, "rally_id"], id="rally-id-null"),
-        pytest.param({"lead_in": 3.5}, ["lead_in"], id="lead-in-over-3"),
-        pytest.param({"lead_out": -1}, ["lead_out"], id="negative-lead-out"),
-        pytest.param({"restored_anchors": [-1]}, ["restored_anchors", 0], id="negative-anchor"),
-        pytest.param({"clips": [{"rally_id": 1, "pieces": [], "cuts": [{"start": 5, "end": 4}]}]}, ["clips", 0, "cuts", 0], id="cut-backwards"),
-        pytest.param({"restored_gaps": [{"start": 4, "end": 5}]}, ["restored_gaps"], id="v2-restored-gaps"),
-        pytest.param({"overlays": {"captions": [{"text": "x" * (CAPTION_MAX_LENGTH + 1), "start": 1, "end": 2}]}}, ["overlays", "captions", 0, "text"], id="caption-81-chars"),
-        pytest.param({"overlays": {"captions": [{"text": "", "start": 1, "end": 2}]}}, ["overlays", "captions", 0, "text"], id="caption-empty"),
-        pytest.param({"view": "split"}, ["view"], id="bad-view"),
+        pytest.param({"segments": [seg("a", 12, 12.2)]}, ["segments", 0], id="shorter-than-0.3"),
+        pytest.param({"segments": [seg("a", 12, 12.24)]}, ["segments", 0], id="0.24-rounds-to-0.2"),
+        pytest.param({"segments": [seg("a", 14, 12)]}, ["segments", 0], id="backwards"),
+        pytest.param({"segments": [seg("a", -1, 2)]}, ["segments", 0, "start"], id="negative-start"),
+        pytest.param({"segments": [seg("a", 1, 2), seg("a", 3, 4)]}, ["segments"], id="repeated-id"),
+        pytest.param({"segments": [seg("", 1, 2)]}, ["segments", 0, "id"], id="empty-id"),
+        pytest.param({"segments": [seg("x" * (SEGMENT_ID_MAX_LENGTH + 1), 1, 2)]}, ["segments", 0, "id"], id="id-too-long"),
+        pytest.param({"segments": [{"start": 1, "end": 2}]}, ["segments", 0, "id"], id="id-required"),
+        pytest.param({"segments": many(MAX_REEL_SEGMENTS + 1)}, ["segments"], id="over-200-segments"),
+        pytest.param({"segments": [{**seg("a", 1, 2), "speed": 0.5}]}, ["segments", 0, "speed"], id="unknown-segment-field"),
+        pytest.param({"captions": [{"text": "x" * (CAPTION_MAX_LENGTH + 1), "start": 1, "end": 2}]}, ["captions", 0, "text"], id="caption-81-chars"),
+        pytest.param({"captions": [{"text": "", "start": 1, "end": 2}]}, ["captions", 0, "text"], id="caption-empty"),
+        pytest.param({"captions": [{"text": "x", "start": 3, "end": 2}]}, ["captions", 0], id="caption-backwards"),
         pytest.param({"format": "1:1"}, ["format"], id="bad-format"),
+        pytest.param({"version": 4}, ["version"], id="v4"),
         pytest.param({"version": 1}, ["version"], id="old-version"),
-        pytest.param({"version": 2}, ["version"], id="v2"),
-        pytest.param({"version": 3}, ["version"], id="v3"),
-        pytest.param({"clips": [{"rally_id": 1, "trim_start": 1, "trim_end": 2}]}, ["clips", 0, "trim_start"], id="v1-clip"),
-        pytest.param({"clipz": []}, ["clipz"], id="unknown-field"),
-        pytest.param({"clips": [[A, {**piece(11, 12), "speed": 0.5}]]}, ["clips", 0, "pieces", 0, "speed"], id="unknown-piece-field"),
+        pytest.param({"clips": []}, ["clips"], id="v4-clips"),
+        pytest.param({"lead_in": 1}, ["lead_in"], id="v4-lead"),
+        pytest.param({"restored_anchors": [25]}, ["restored_anchors"], id="v4-anchors"),
+        pytest.param({"overlays": {"captions": []}}, ["overlays"], id="v4-overlays"),
+        pytest.param({"view": "cut"}, ["view"], id="v4-view"),
     ],
 )  # fmt: skip
 def test_invalid_edit_is_rejected(
@@ -452,40 +453,20 @@ def test_invalid_edit_is_rejected(
     edit: dict[str, Any],
     loc: list[str | int],
 ) -> None:
-    # [A, piece...] is shorthand for a clip of rally A; a dict may name its rally
-    # by index too ("rally_index": A)
-    clips = [
-        clip(video[1][c[0]], *c[1:])
-        if isinstance(c, list)
-        else {k: v for k, v in c.items() if k != "rally_index"}
-        | ({"rally_id": video[1][c["rally_index"]]} if "rally_index" in c else {})
-        for c in edit.get("clips", [])
-    ]
-    body = {**edit, "clips": clips} if "clips" in edit else edit
     r = client.put(
         f"{API}/videos/{video[0]}/reel",
         headers=normal_user_token_headers,
-        json={"title": "x", "edit": body},
+        json={"title": "x", "edit": edit},
     )
     assert r.status_code == 422, r.text
     locs = [e["loc"] for e in r.json()["detail"]]
     assert ["body", "edit", *loc] in locs, locs
 
 
-def test_rally_of_another_video_is_rejected(
-    client: TestClient,
-    db: Session,
-    video: tuple[uuid.UUID, list[int]],
-    normal_user_token_headers: dict[str, str],
-) -> None:
-    _, other_rallies = make_video(db, settings.EMAIL_TEST_USER)
-    r = client.put(
-        f"{API}/videos/{video[0]}/reel",
-        headers=normal_user_token_headers,
-        json={"title": "x", "edit": {"clips": [clip(other_rallies[0], piece(10, 12))]}},
-    )
-    assert r.status_code == 422
-    assert r.json()["detail"][0]["msg"] == "not a rally of this video"
+def test_without_a_duration_only_pydantic_checks_apply() -> None:
+    """A video whose duration couldn't be read (never the case after upload)."""
+    edit = ReelEdit.model_validate({"segments": [seg("a", 500, 600)]})
+    assert edit.problems(duration=None) == []
 
 
 def test_all_problems_are_reported_at_once(
@@ -493,14 +474,9 @@ def test_all_problems_are_reported_at_once(
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> None:
-    a, b = video[1]
     edit = {
-        "clips": [
-            clip(a, piece(10, 12)),
-            clip(999_999_999, piece(1, 2)),
-            clip(b, piece(20, 31), piece(44, 50)),
-        ],
-        "overlays": {"captions": [{"text": "x", "start": 1, "end": 500}]},
+        "segments": [seg("a", 10, 12), seg("b", 115, 121), seg("c", 100, 125)],
+        "captions": [{"text": "x", "start": 1, "end": 500}],
     }
     r = client.put(
         f"{API}/videos/{video[0]}/reel",
@@ -509,57 +485,33 @@ def test_all_problems_are_reported_at_once(
     )
     assert r.status_code == 422
     assert [e["loc"] for e in r.json()["detail"]] == [
-        ["body", "edit", "clips", 1, "rally_id"],
-        ["body", "edit", "clips", 2, "pieces", 0, "start"],
-        ["body", "edit", "clips", 2, "pieces", 1, "end"],
-        ["body", "edit", "overlays", "captions", 0, "end"],
+        ["body", "edit", "segments", 1, "end"],
+        ["body", "edit", "segments", 2, "end"],
+        ["body", "edit", "captions", 0, "end"],
     ]
-    assert r.json()["detail"][1]["msg"] == (
-        "must be within the rally (30.00-45.00 s) widened by lead_in/lead_out "
-        "(29.00-46.00 s)"
-    )
-    assert "within the video (0-120.00 s)" in r.json()["detail"][3]["msg"]
+    assert r.json()["detail"][0]["msg"] == "must be within the video (0-120.00 s)"
 
 
 def test_limits_that_are_allowed(
-    client: TestClient,
-    db: Session,
-    normal_user_token_headers: dict[str, str],
-    create: CreateFn,
-    video: tuple[uuid.UUID, list[int]],
+    create: CreateFn, video: tuple[uuid.UUID, list[int]]
 ) -> None:
-    """Edges: pieces exactly at the padded bounds (and a hair past, as JavaScript
-    may compute them), touching pieces, the maximum 3 s lead, an 80-character
-    caption, a rally used by two clips."""
-    a, b = video[1]
+    """Edges: 200 segments, 0.3 s ones, overlapping ones (replays) in any order, the
+    video's end (with the 0.1 s player tolerance), a 64-character id, an
+    80-character caption, footage outside the rallies (rally_id null)."""
+    a, _ = video[1]
     edit = {
-        "lead_in": 3,
-        "lead_out": 3,
-        "clips": [
-            clip(a, piece(7.0 - 0.005, 15), piece(15, 23.0 + 0.005, slow_mo=True)),
-            clip(b, piece(27, 48)),
-            clip(a, piece(10, 20)),
+        "segments": [
+            seg("x" * SEGMENT_ID_MAX_LENGTH, 30, 30.3),
+            seg("end", 119.5, DURATION + 0.05),
+            seg("rally", 9, 21, rally_id=a),
+            seg("replay", 12, 14, slow_mo=True, rally_id=a),
+            *many(MAX_REEL_SEGMENTS - 4, length=0.3),
         ],
-        "restored_anchors": [DURATION - 1],  # after the last piece
-        "overlays": {"captions": [{"text": "x" * CAPTION_MAX_LENGTH, "start": 0, "end": DURATION}]},
-    }  # fmt: skip
+        "captions": [{"text": "x" * CAPTION_MAX_LENGTH, "start": 0, "end": DURATION}],
+    }
     reel = create(edit=edit)
-    assert len(reel["edit"]["clips"]) == 3
-    # A rally near the end of the video: past its 3 s lead-out, the end of the
-    # video is the limit (with the 0.1 s player tolerance)
-    late_video, _ = make_video(db, settings.EMAIL_TEST_USER)
-    late = Rally(video_id=late_video, start=110.0, end=119.0)
-    db.add(late)
-    db.commit()
-    for end, status in [(DURATION + 0.05, 201), (DURATION + 0.5, 422)]:
-        late_clip = clip(late.id or 0, piece(112, end))
-        r = client.put(
-            f"{API}/videos/{late_video}/reel",
-            headers=normal_user_token_headers,
-            json={"title": "x", "edit": {"lead_out": 3, "clips": [late_clip]}},
-        )
-        assert r.status_code == status, r.text
-    assert "within the video" in r.json()["detail"][0]["msg"]
+    assert len(reel["edit"]["segments"]) == MAX_REEL_SEGMENTS
+    assert reel["edit"]["segments"][1]["end"] == DURATION  # stored to 0.1 s
 
 
 @pytest.mark.parametrize("title", ["", "x" * 101])
@@ -588,12 +540,12 @@ def test_update_is_validated_against_the_video_too(
         headers=normal_user_token_headers,
         json={
             "title": "x",
-            "edit": {"clips": [clip(999_999_999, piece(1, 2))]},
+            "edit": {"segments": [seg("a", 100, 130)]},
             "updated_at": reel["updated_at"],
         },
     )
     assert r.status_code == 422
-    assert r.json()["detail"][0]["loc"] == ["body", "edit", "clips", 0, "rally_id"]
+    assert r.json()["detail"][0]["loc"] == ["body", "edit", "segments", 0, "end"]
     # Nothing was saved, so the original updated_at still works
     r = client.put(
         f"{API}/reels/{reel['id']}",
@@ -609,5 +561,5 @@ def test_reel_rows_store_plain_json(
     """The edit list is a JSONB document with the version inside."""
     create(edit=full_edit(video[1]))
     row = db.exec(select(Reel).where(col(Reel.video_id) == video[0])).one()
-    assert row.edit["version"] == 4
-    assert row.edit["clips"][0]["pieces"][1]["slow_mo"] is True
+    assert row.edit["version"] == 5
+    assert row.edit["segments"][2]["slow_mo"] is True

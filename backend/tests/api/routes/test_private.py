@@ -204,13 +204,8 @@ def _export_for_fixture_tests(
     )
     rally = client.get(f"{api}/videos/{video.id}/rallies", headers=headers).json()
     edit = {
-        "lead_in": 0,
-        "lead_out": 0,
-        "clips": [
-            {
-                "rally_id": rally["data"][0]["id"],
-                "pieces": [{"start": 0.5, "end": 2.0}],
-            }
+        "segments": [
+            {"id": "a", "start": 0.5, "end": 2.0, "rally_id": rally["data"][0]["id"]}
         ],
     }
     r = client.put(
@@ -219,9 +214,7 @@ def _export_for_fixture_tests(
         json={"title": "Fixture", "edit": edit, "updated_at": None},
     )
     assert r.status_code == 201, r.text
-    r = client.post(
-        f"{api}/videos/{video.id}/reel/exports", headers=headers, json={}
-    )
+    r = client.post(f"{api}/videos/{video.id}/reel/exports", headers=headers, json={})
     assert r.status_code == 201, r.text
     return str(r.json()["id"])
 

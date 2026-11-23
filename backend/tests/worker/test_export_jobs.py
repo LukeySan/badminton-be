@@ -126,9 +126,9 @@ def test_failing_ffmpeg_fails_the_export_not_the_worker(
                 return run_worker.render_export(*args)
         return run_worker.render_export(*args)
 
-    stop_when_idle(monkeypatch)
     caplog.set_level("INFO", logger="worker")
-    serve(engine, lambda *_: detection({"start": 1.0, "end": 2.0}), renderer=renderer)
+    serve(engine, lambda *_: detection({"start": 1.0, "end": 2.0}), renderer=renderer,
+          wait=stop_when_idle())  # fmt: skip
 
     failed = fetch_export(engine, broken.id)
     assert (failed.status, failed.failure_reason, failed.claim_id) == (

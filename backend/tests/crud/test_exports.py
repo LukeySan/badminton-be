@@ -29,7 +29,7 @@ from tests.crud.test_video_jobs import (  # noqa: F401  (empty_videos is a fixtu
 )
 
 EDIT = ReelEdit.model_validate(
-    {"clips": [{"rally_id": 1, "pieces": [{"start": 1.0, "end": 3.0}]}]}
+    {"segments": [{"id": "a", "start": 1.0, "end": 3.0, "rally_id": None}]}
 )
 
 

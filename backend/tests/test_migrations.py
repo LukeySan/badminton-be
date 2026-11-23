@@ -1,10 +1,14 @@
 """Data conversions inside migrations (pure functions, loaded from the file)."""
 
 import importlib.util
+import json
 from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
+from app.export_snapshot import build_snapshot
 from app.models import ReelEdit
 
 VERSIONS = Path(__file__).resolve().parents[1] / "app" / "alembic" / "versions"
@@ -23,11 +27,17 @@ reel_v2 = load("6acbb05a9b0b")
 one_reel = load("9bd7ddc4eed1")
 reel_v3 = load("d769f6b0ca89")
 reel_v4 = load("ec4778601b52")
+reel_v5 = load("8f3a5c2d9e14")
 
 
 def to_current(v2_edit: dict[str, Any], duration: float = 120.0) -> dict[str, Any]:
     """A v2 edit through the later migrations, to validate it as today's ReelEdit."""
-    return reel_v4.edit_v3_to_v4(reel_v3.edit_v2_to_v3(v2_edit), RALLIES, duration)
+    v4 = reel_v4.edit_v3_to_v4(reel_v3.edit_v2_to_v3(v2_edit), RALLIES, duration)
+    return v4_to_current(v4, duration)
+
+
+def v4_to_current(v4_edit: dict[str, Any], duration: float = 120.0) -> dict[str, Any]:
+    return reel_v5.edit_v4_to_v5(v4_edit, RALLIES, duration)
 
 
 RALLIES = {1: (10.0, 20.0), 2: (30.0, 45.0)}
@@ -189,7 +199,7 @@ def test_each_restored_range_becomes_its_midpoint() -> None:
     new = reel_v3.edit_v2_to_v3(v2((50, 60), (21, 29), (0, 8.335)))
     expected = {k: v for k, v in v2().items() if k != "restored_gaps"}
     assert new == {**expected, "version": 3, "restored_anchors": [4.168, 25, 55]}
-    ReelEdit.model_validate(reel_v4.edit_v3_to_v4(new, RALLIES, 120.0))
+    ReelEdit.model_validate(v4_to_current(reel_v4.edit_v3_to_v4(new, RALLIES, 120.0)))
 
 
 def test_v3_is_left_alone() -> None:
@@ -255,7 +265,7 @@ def test_window_parts_no_piece_covers_become_cuts() -> None:
     assert new["version"] == 4
     assert cuts_of(new) == [[(9, 10), (14, 16)], [(40, 46)]]
     assert new["restored_anchors"] == [25.0]
-    ReelEdit.model_validate(new)
+    ReelEdit.model_validate(v4_to_current(new))
 
 
 def test_windows_like_the_editor() -> None:
@@ -292,3 +302,143 @@ def test_v4_downgrade_drops_cuts_and_round_trips() -> None:
     assert reel_v4.edit_v4_to_v3(new) == old
     assert reel_v4.edit_v3_to_v4(new, RALLIES, 120.0) is new  # v4 left alone
     assert reel_v4.edit_v4_to_v3(old) is old
+
+
+# --- v4 -> v5: the segments v4 played -----------------------------------------------
+
+EDIT_V4 = Path(__file__).resolve().parent / "fixtures" / "edit_v4"
+
+
+def v4_cases() -> list[Path]:
+    files = sorted(EDIT_V4.glob("*.json"))
+    assert files, f"no v4 cases in {EDIT_V4}"
+    return files
+
+
+@pytest.mark.parametrize("path", v4_cases(), ids=lambda p: p.stem)
+def test_v4_reels_become_the_segments_they_played(path: Path) -> None:
+    """Each v4 reel plays the same as v5: the segments its Rallies-only playback
+    played, in order (restored stretches unlabelled), and its export has the same
+    captions and length."""
+    case = json.loads(path.read_text(encoding="utf-8"))
+    rallies = {r["id"]: (r["start"], r["end"]) for r in case["rallies"]}
+    new = reel_v5.edit_v4_to_v5(case["edit"], rallies, case["duration"])
+    edit = ReelEdit.model_validate(new)
+    expected = case["expected"]
+
+    assert [(s.start, s.end, s.slow_mo) for s in edit.segments] == [
+        (e["start"], e["end"], e["slow_mo"]) for e in expected["segments"]
+    ]
+    assert [s.rally_id is None for s in edit.segments] == [
+        e["kind"] == "gap" for e in expected["segments"]
+    ]
+    snapshot = build_snapshot(edit, duration=case["duration"])
+    assert snapshot.model_dump()["captions"] == expected["captions"]
+    assert snapshot.duration == expected["duration"]
+    assert new["format"] == case["edit"]["format"]
+
+
+def test_pieces_keep_their_rally_label_and_ids_are_in_order() -> None:
+    old = v3(pieces(2, (29, 46)), pieces(1, (9, 21)), pieces(99, (50, 52)))
+    old["restored_anchors"] = []
+    v4 = reel_v4.edit_v3_to_v4(old, RALLIES, 120.0)
+    new = reel_v5.edit_v4_to_v5(v4, RALLIES, 120.0)
+    assert new == {
+        "version": 5,
+        "format": "16:9",
+        "segments": [
+            {"id": "s1", "start": 29, "end": 46, "slow_mo": False, "rally_id": 2},
+            {"id": "s2", "start": 9, "end": 21, "slow_mo": False, "rally_id": 1},
+            # rally 99 doesn't exist (any more): still plays, unlabelled
+            {"id": "s3", "start": 50, "end": 52, "slow_mo": False, "rally_id": None},
+        ],
+        "captions": [],
+    }
+
+
+def test_times_go_to_tenths_and_slivers_join_a_neighbour() -> None:
+    """v5 keeps 0.1 s and needs 0.3 s: 12.04 -> 12.0, 20.46 -> 20.5; a 0.2 s piece
+    touching one of the same speed joins it, one on its own is dropped."""
+    old = {
+        "version": 4,
+        "view": "cut",
+        "format": "9:16",
+        "lead_in": 1.0,
+        "lead_out": 1.0,
+        "clips": [
+            {"rally_id": 1, "pieces": [
+                {"start": 9.0, "end": 12.04, "slow_mo": False},
+                {"start": 12.04, "end": 12.24, "slow_mo": False},  # joins the first
+                {"start": 15.0, "end": 20.46, "slow_mo": True},
+            ], "cuts": []},
+            {"rally_id": 2, "pieces": [
+                {"start": 29.5, "end": 29.7, "slow_mo": False},  # alone: dropped
+                {"start": 30.0, "end": 30.2, "slow_mo": True},  # joins the next
+                {"start": 30.2, "end": 40.0, "slow_mo": True},
+            ], "cuts": []},
+        ],
+        "restored_anchors": [],
+        "overlays": {"trail": True, "captions": [{"text": "x", "start": 1, "end": 2}]},
+    }  # fmt: skip
+    new = reel_v5.edit_v4_to_v5(old, RALLIES, 120.0)
+    assert [(s["start"], s["end"], s["slow_mo"]) for s in new["segments"]] == [
+        (9.0, 12.2, False),
+        (15.0, 20.5, True),
+        (30.0, 40.0, True),
+    ]
+    assert [s["id"] for s in new["segments"]] == ["s1", "s2", "s3"]
+    assert new["captions"] == [{"text": "x", "start": 1, "end": 2}]
+    assert new["format"] == "9:16"
+    ReelEdit.model_validate(new)
+
+
+def test_v5_is_left_alone() -> None:
+    already = ReelEdit().model_dump(mode="json")
+    assert reel_v5.edit_v4_to_v5(already, RALLIES, 120.0) is already
+    assert (
+        reel_v5.edit_v5_to_v4(load_case("01")["edit"], RALLIES)
+        == load_case("01")["edit"]
+    )
+
+
+def load_case(prefix: str) -> dict[str, Any]:
+    (path,) = EDIT_V4.glob(f"{prefix}-*.json")
+    return dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize("prefix", ["01", "03", "04"])
+def test_downgrade_round_trips_plain_reels(prefix: str) -> None:
+    """Rally clips with 1 s leads and restored breaks between them come back as
+    they were (each break's anchor at its middle)."""
+    case = load_case(prefix)
+    rallies = {r["id"]: (r["start"], r["end"]) for r in case["rallies"]}
+    v5 = reel_v5.edit_v4_to_v5(case["edit"], rallies, case["duration"])
+    assert reel_v5.edit_v5_to_v4(v5, rallies) == case["edit"]
+
+
+def test_downgrade_where_possible() -> None:
+    """A replay of the same rally starts another clip; leads grow to fit (up to
+    3 s, further is cut off); footage of a deleted rally becomes a restored anchor;
+    captions go back to overlays."""
+    v5 = {
+        "version": 5,
+        "format": "16:9",
+        "segments": [
+            {"id": "a", "start": 8.5, "end": 15, "slow_mo": False, "rally_id": 1},
+            {"id": "b", "start": 15, "end": 21, "slow_mo": True, "rally_id": 1},
+            {"id": "c", "start": 30, "end": 52, "slow_mo": False, "rally_id": 2},
+            {"id": "d", "start": 12, "end": 14, "slow_mo": True, "rally_id": 1},
+            {"id": "e", "start": 60, "end": 64, "slow_mo": False, "rally_id": 7},
+        ],
+        "captions": [{"text": "x", "start": 1, "end": 2}],
+    }
+    old = reel_v5.edit_v5_to_v4(v5, RALLIES)
+    assert (old["version"], old["lead_in"], old["lead_out"]) == (4, 1.5, 3.0)
+    assert [(c["rally_id"], [(p["start"], p["end"]) for p in c["pieces"]]) for c in old["clips"]] == [
+        (1, [(8.5, 15), (15, 21)]),
+        (2, [(30, 48)]),  # 52 is past rally 2's end + 3 s
+        (1, [(12, 14)]),  # a replay: its own clip
+    ]  # fmt: skip
+    assert old["restored_anchors"] == [62]
+    assert old["overlays"] == {"trail": False, "captions": v5["captions"]}
+    assert all(c["cuts"] == [] for c in old["clips"])

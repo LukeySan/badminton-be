@@ -1,9 +1,9 @@
 """
 Rally corrections: the user fixes what the detector found. Every change is logged in
-the `correction` table next to the detector's original bounds (training labels), and
-reels that use a changed rally are adjusted in the same transaction. Each endpoint
-returns a RallyChange: what was added/updated/deleted, the renumbered list, and the
-reels that were adjusted.
+the `correction` table next to the detector's original bounds (training labels).
+Each endpoint returns a RallyChange: what was added/updated/deleted and the
+renumbered list. Reels aren't changed: their segments are times in the video (a
+deleted rally's segments keep playing; their rally_id label reads as null).
 
 Not allowed while the video is queued or processing (re-analysis replaces all
 rallies, which would undo the correction).
@@ -67,8 +67,7 @@ def edit_rally(
     times: RallyTimes,
 ) -> Any:
     """
-    Set a rally's start and end. Reel pieces outside the new bounds (plus each
-    reel's lead_in/lead_out) are trimmed.
+    Set a rally's start and end.
     """
     get_video_for_user(session, current_user, id)
     return run(
@@ -88,7 +87,8 @@ def delete_rally(
     session: SessionDep, current_user: CurrentUser, id: uuid.UUID, rally_id: int
 ) -> Any:
     """
-    Delete a rally (e.g. a false detection). Reel clips of it are dropped.
+    Delete a rally (e.g. a false detection). Reel segments of it keep playing,
+    labelled rally_id null.
     """
     get_video_for_user(session, current_user, id)
     return run(
@@ -142,7 +142,7 @@ def split_rally(
 ) -> Any:
     """
     Split a rally in two at `at` seconds. The first part keeps the id; the second
-    is a new rally. Reel clips are split the same way.
+    is a new rally.
     """
     get_video_for_user(session, current_user, id)
     return run(
@@ -161,8 +161,8 @@ def merge_rallies(
     session: SessionDep, current_user: CurrentUser, id: uuid.UUID, merge: RallyMerge
 ) -> Any:
     """
-    Merge two neighbouring rallies into one new rally (new id). Reel clips of
-    either point at the new rally; back-to-back clips of the two become one.
+    Merge two neighbouring rallies into one new rally (new id). Reel segments of
+    either keep playing, labelled rally_id null (both old rallies are gone).
     """
     get_video_for_user(session, current_user, id)
     return run(

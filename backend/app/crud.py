@@ -25,7 +25,7 @@ from app.models import (
     RallyPublic,
     Reel,
     ReelEdit,
-    ReelImpact,
+    ReelPublic,
     User,
     UserCreate,
     UserUpdate,
@@ -33,13 +33,6 @@ from app.models import (
     VideoPublic,
     export_filename,
     get_datetime_utc,
-)
-from app.reel_ops import (
-    Retarget,
-    Target,
-    best_overlap,
-    normalize_edit,
-    retarget_edit,
 )
 
 
@@ -477,51 +470,10 @@ def finish_video(
         for r in rallies
     ]  # fmt: skip
     session.add_all(new_rallies)
-    session.flush()  # assigns the new rally ids
-    # New ids: point reel clips at the new rally covering the same time
-    targets = [Target(r.id, r.start, r.end) for r in new_rallies if r.id is not None]
-    _retarget_reels(session, video_id, lambda clip: best_overlap(clip, targets))
+    # Reels aren't touched: their segments are times. Labels of the old rallies now
+    # read as null (ReelEdit.with_known_rallies).
     session.commit()
     return True
-
-
-def _retarget_reels(
-    session: Session,
-    video_id: uuid.UUID,
-    retarget: Retarget,
-    join: tuple[int, int] | None = None,
-) -> list[ReelImpact]:
-    """Adjust the video's reels to changed rallies (see app/reel_ops.py), in the
-    caller's transaction. Changed reels get a new updated_at, so an editor that has
-    one open gets a 409 on its next save and reloads.
-    FOR UPDATE: a user's save at the same moment waits, then gets that 409, instead
-    of overwriting this or being overwritten."""
-    reels = session.exec(
-        select(Reel)
-        .where(col(Reel.video_id) == video_id, col(Reel.deleted_at).is_(None))
-        .order_by(col(Reel.updated_at).desc())
-        .with_for_update()
-    ).all()
-    impacts = []
-    for reel in reels:
-        old = ReelEdit.model_validate(reel.edit)
-        new, impact = retarget_edit(old, retarget, join)
-        if new == old:
-            continue
-        reel.edit = new.model_dump(mode="json")  # a new dict: SQLAlchemy sees it
-        reel.updated_at = get_datetime_utc()
-        session.add(reel)
-        impacts.append(
-            ReelImpact(
-                id=reel.id,
-                title=reel.title,
-                updated_at=reel.updated_at,
-                clips_removed=impact.clips_removed,
-                pieces_trimmed=impact.pieces_trimmed,
-                pieces_removed=impact.pieces_removed,
-            )
-        )
-    return impacts
 
 
 def fail_video(
@@ -584,8 +536,8 @@ def _live_reel(reel_id: uuid.UUID) -> tuple[Any, ...]:
 
 def lock_video_for_reel_save(*, session: Session, video_id: uuid.UUID) -> None:
     """FOR SHARE on the video row until the caller's commit: rally corrections and
-    re-analysis (which lock or update that row) wait until the reel is saved, so a
-    reel can't be validated against rallies that change before it's written."""
+    re-analysis (which lock or update that row) wait until the reel is saved, so its
+    rally labels are checked against the rallies as they are when it's written."""
     session.exec(
         select(Video.id).where(col(Video.id) == video_id).with_for_update(read=True)
     ).one()
@@ -598,6 +550,15 @@ def video_rally_bounds(
         select(Rally.id, Rally.start, Rally.end).where(col(Rally.video_id) == video_id)
     ).all()
     return {i: (start, end) for i, start, end in rows if i is not None}
+
+
+def reel_public(*, session: Session, reel: Reel) -> ReelPublic:
+    """The reel as the API returns it. A segment's rally_id is a label: one of a
+    rally deleted since (a correction, re-analysis) reads as null; the stored reel
+    isn't changed, so an editor that has it open isn't disturbed."""
+    known = set(video_rally_bounds(session=session, video_id=reel.video_id))
+    edit = ReelEdit.model_validate(reel.edit).with_known_rallies(known)
+    return ReelPublic.model_validate(reel, update={"edit": edit})
 
 
 def list_reels(
@@ -630,7 +591,7 @@ def create_reel(
             video_id=video.id,
             owner_id=video.owner_id,
             title=title,
-            edit=normalize_edit(edit, video.duration).model_dump(mode="json"),
+            edit=edit.model_dump(mode="json"),
             created_at=now,
             updated_at=now,
         )
@@ -673,7 +634,6 @@ def save_video_reel(
         title=title,
         edit=edit,
         expected_updated_at=expected_updated_at,
-        duration=video.duration,
     ):
         return None, False
     session.refresh(reel)
@@ -692,19 +652,17 @@ def update_reel(
     title: str,
     edit: ReelEdit,
     expected_updated_at: datetime,
-    duration: float | None = None,
 ) -> bool:
     """Replace the title and edit list, only if the reel is unchanged since the
     caller loaded it (updated_at still matches; optimistic locking). One
     conditional UPDATE, so two saves at once can't both pass the check.
-    duration: the video's, to tell which restored anchors are still live
-    (normalize_edit). False = changed since, or deleted."""
+    False = changed since, or deleted."""
     result = session.exec(
         update(Reel)
         .where(*_live_reel(reel_id), col(Reel.updated_at) == expected_updated_at)
         .values(
             title=title,
-            edit=normalize_edit(edit, duration).model_dump(mode="json"),
+            edit=edit.model_dump(mode="json"),
             updated_at=get_datetime_utc(),
         )
     )
@@ -724,7 +682,8 @@ def soft_delete_reel(*, session: Session, reel_id: uuid.UUID) -> bool:
 # --- Rally corrections ----------------------------------------------------------
 # Each correction is one transaction: lock the video row (so it can't be queued or
 # re-analyzed meanwhile, and reel saves wait), change the rallies, log the change in
-# `correction`, adjust the reels, commit. Refusals raise CorrectionRefused.
+# `correction`, commit. Reels aren't touched (their segments are times; a deleted
+# rally's label reads as null). Refusals raise CorrectionRefused.
 
 
 class CorrectionRefused(Exception):
@@ -834,14 +793,7 @@ class _Correction:
         added: Sequence[Rally] = (),
         updated: Sequence[Rally] = (),
         deleted: Sequence[int] = (),
-        retarget: Retarget | None = None,
-        join: tuple[int, int] | None = None,
     ) -> RallyChange:
-        reels = (
-            _retarget_reels(self.session, self.video_id, retarget, join)
-            if retarget
-            else []
-        )
         self.session.commit()
         rallies = numbered_rallies(session=self.session, video_id=self.video_id)
         by_id = {r.id: r for r in rallies}
@@ -850,7 +802,6 @@ class _Correction:
             updated=[by_id[r.id] for r in updated if r.id in by_id],
             deleted=list(deleted),
             rallies=rallies,
-            reels=reels,
         )
 
 
@@ -893,11 +844,7 @@ def edit_rally(
     rally.is_maybe = False  # the user reshaped it, so it's a rally to them
     session.add(rally)
     c.log("edit", rally, rally, _detected(rally))
-    target = Target(rally_id, start, end)
-    return c.finish(
-        updated=[rally],
-        retarget=lambda clip: [target] if clip.rally_id == rally_id else None,
-    )
+    return c.finish(updated=[rally])
 
 
 def confirm_rally(
@@ -937,10 +884,7 @@ def delete_rally(
     rally = c.get(rally_id)
     c.log("delete", rally, None, _detected(rally))
     session.delete(rally)
-    return c.finish(
-        deleted=[rally_id],
-        retarget=lambda clip: [] if clip.rally_id == rally_id else None,
-    )
+    return c.finish(deleted=[rally_id])
 
 
 def split_rally(
@@ -976,12 +920,7 @@ def split_rally(
     assert second.id is not None
     c.log("split", rally, rally, _detected(rally))
     c.log("split", rally, second, _detected(rally))
-    targets = [Target(rally_id, rally.start, at), Target(second.id, at, second.end)]
-    return c.finish(
-        added=[second],
-        updated=[rally],
-        retarget=lambda clip: targets if clip.rally_id == rally_id else None,
-    )
+    return c.finish(added=[second], updated=[rally])
 
 
 def merge_rallies(
@@ -1023,13 +962,7 @@ def merge_rallies(
     old_ids = {first.id, second.id}
     session.delete(first)
     session.delete(second)
-    target = Target(merged.id, merged.start, merged.end)
-    return c.finish(
-        added=[merged],
-        deleted=sorted(old_ids),
-        retarget=lambda clip: [target] if clip.rally_id in old_ids else None,
-        join=(first.id, second.id),
-    )
+    return c.finish(added=[merged], deleted=sorted(old_ids))
 
 
 # --- Exports --------------------------------------------------------------------

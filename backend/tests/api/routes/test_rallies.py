@@ -66,12 +66,13 @@ def make_reel(
     client: TestClient,
     headers: dict[str, str],
     video_id: uuid.UUID,
-    clips: list[tuple[int, list[tuple[float, float]]]],
+    segments: list[tuple[int | None, float, float]],
 ) -> dict[str, Any]:
+    """The video's reel with these (rally_id, start, end) segments."""
     edit = {
-        "clips": [
-            {"rally_id": r, "pieces": [{"start": s, "end": e} for s, e in pieces]}
-            for r, pieces in clips
+        "segments": [
+            {"id": f"s{i}", "start": s, "end": e, "rally_id": r}
+            for i, (r, s, e) in enumerate(segments)
         ]
     }
     r = client.put(
@@ -84,14 +85,18 @@ def make_reel(
     return reel
 
 
-def reel_clips(
+def reel_segments(
     client: TestClient, headers: dict[str, str], video_id: uuid.UUID
-) -> list[tuple[int, list[tuple[float, float]]]]:
+) -> list[tuple[int | None, float, float]]:
     r = client.get(f"{API}/videos/{video_id}/reel", headers=headers)
-    return [
-        (c["rally_id"], [(p["start"], p["end"]) for p in c["pieces"]])
-        for c in r.json()["edit"]["clips"]
-    ]
+    return [(s["rally_id"], s["start"], s["end"]) for s in r.json()["edit"]["segments"]]
+
+
+def reel_updated_at(
+    client: TestClient, headers: dict[str, str], video_id: uuid.UUID
+) -> str:
+    r = client.get(f"{API}/videos/{video_id}/reel", headers=headers)
+    return str(r.json()["updated_at"])
 
 
 # --- the list -----------------------------------------------------------------
@@ -127,7 +132,8 @@ def test_add_rally(
     # Inserted between rallies 1 and 2: the later ones are renumbered
     assert spans(change) == [(1, 10, 20), (2, 20, 28), (3, 30, 45), (4, 60, 70)]
     assert spans(change, "added") == [(2, 20, 28)]
-    assert change["updated"] == change["deleted"] == change["reels"] == []
+    assert change["updated"] == change["deleted"] == []
+    assert "reels" not in change  # rally fixes don't edit reels
 
     new_id = change["added"][0]["id"]
     added = db.get(Rally, new_id)
@@ -169,31 +175,26 @@ def test_add_refused(
 # --- edit ---------------------------------------------------------------------
 
 
-def test_edit_rally_trims_reel_pieces(
+def test_edit_rally_leaves_reels_alone(
     client: TestClient,
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> None:
+    """Segments are times in the video: a rally fix doesn't change them, and an
+    editor that has the reel open can still save."""
     h, (a, b, _) = normal_user_token_headers, video[1]
-    reel = make_reel(client, h, video[0], [(a, [(9.5, 12), (16, 21)]), (b, [(31, 33)])])
+    reel = make_reel(client, h, video[0], [(a, 9.5, 12), (a, 16, 21), (b, 31, 33)])
     r = client.put(url(video[0], f"/{a}"), headers=h, json={"start": 11, "end": 18})
     assert r.status_code == 200, r.text
-    change = r.json()
-    assert spans(change, "updated") == [(1, 11, 18)]
-    # Pieces may reach 10-19 now (1 s lead): both pieces trimmed
-    assert reel_clips(client, h, video[0]) == [(a, [(10, 12), (16, 19)]), (b, [(31, 33)])]  # fmt: skip
-    (impact,) = change["reels"]
-    assert impact["id"] == reel["id"]
-    assert (impact["clips_removed"], impact["pieces_trimmed"], impact["pieces_removed"]) == (0, 2, 0)  # fmt: skip
-    assert impact["updated_at"] > reel["updated_at"]
-
-    # An editor still holding the old version must reload
+    assert spans(r.json(), "updated") == [(1, 11, 18)]
+    assert reel_segments(client, h, video[0]) == [(a, 9.5, 12), (a, 16, 21), (b, 31, 33)]  # fmt: skip
+    assert reel_updated_at(client, h, video[0]) == reel["updated_at"]
     r = client.put(
         f"{API}/videos/{video[0]}/reel",
         headers=h,
-        json={"title": "x", "edit": {}, "updated_at": reel["updated_at"]},
+        json={"title": "x", "edit": reel["edit"], "updated_at": reel["updated_at"]},
     )
-    assert r.status_code == 409 and r.json()["code"] == "reel_changed"
+    assert r.status_code == 200
 
 
 def test_corrections_keep_the_detectors_original(
@@ -248,21 +249,22 @@ def test_edit_may_grow_into_the_break_but_not_into_another_rally(
 # --- delete -------------------------------------------------------------------
 
 
-def test_delete_rally_drops_its_reel_clips(
+def test_delete_rally_keeps_its_reel_segments_unlabelled(
     client: TestClient,
     db: Session,
     video: tuple[uuid.UUID, list[int]],
     normal_user_token_headers: dict[str, str],
 ) -> None:
     h, (a, b, _) = normal_user_token_headers, video[1]
-    reel = make_reel(client, h, video[0], [(a, [(10, 12)]), (b, [(31, 33)])])
+    reel = make_reel(client, h, video[0], [(a, 10, 12), (b, 31, 33)])
     r = client.delete(url(video[0], f"/{a}"), headers=h)
     assert r.status_code == 200, r.text
     change = r.json()
     assert change["deleted"] == [a]
     assert spans(change) == [(1, 30, 45), (2, 60, 70)]
-    assert [(i["id"], i["clips_removed"]) for i in change["reels"]] == [(reel["id"], 1)]
-    assert reel_clips(client, h, video[0]) == [(b, [(31, 33)])]
+    # Still plays; its label reads as null; the reel itself isn't changed
+    assert reel_segments(client, h, video[0]) == [(None, 10, 12), (b, 31, 33)]
+    assert reel_updated_at(client, h, video[0]) == reel["updated_at"]
 
     (log,) = corrections(db, video[0])
     assert (log.action, log.rally_id, log.result_rally_id) == ("delete", a, None)
@@ -270,21 +272,6 @@ def test_delete_rally_drops_its_reel_clips(
     assert (log.edited_start, log.edited_end) == (None, None)
     # The log outlives the rally
     assert client.delete(url(video[0], f"/{a}"), headers=h).status_code == 404
-
-
-def test_reel_without_the_rally_is_left_alone(
-    client: TestClient,
-    video: tuple[uuid.UUID, list[int]],
-    normal_user_token_headers: dict[str, str],
-) -> None:
-    """No clip of the deleted rally: the reel isn't touched, so an open editor
-    doesn't have to reload."""
-    h, (a, b, _) = normal_user_token_headers, video[1]
-    reel = make_reel(client, h, video[0], [(b, [(31, 33)])])
-    r = client.delete(url(video[0], f"/{a}"), headers=h)
-    assert r.json()["reels"] == []
-    r = client.get(f"{API}/videos/{video[0]}/reel", headers=h)
-    assert r.json()["updated_at"] == reel["updated_at"]
 
 
 # --- split --------------------------------------------------------------------
@@ -297,7 +284,7 @@ def test_split_rally(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     h, (a, b, _) = normal_user_token_headers, video[1]
-    make_reel(client, h, video[0], [(a, [(10, 12), (13, 17)]), (b, [(31, 33)])])
+    make_reel(client, h, video[0], [(a, 10, 12), (a, 13, 17), (b, 31, 33)])
     r = client.post(url(video[0], f"/{a}/split"), headers=h, json={"at": 15})
     assert r.status_code == 200, r.text
     change = r.json()
@@ -306,14 +293,8 @@ def test_split_rally(
     assert change["updated"][0]["id"] == a  # the first part keeps the id
     assert spans(change, "added") == [(2, 15, 20)]
     assert spans(change) == [(1, 10, 15), (2, 15, 20), (3, 30, 45), (4, 60, 70)]
-    # The clip is split the same way, nothing lost
-    assert reel_clips(client, h, video[0]) == [
-        (a, [(10, 12), (13, 15)]),
-        (second, [(15, 17)]),
-        (b, [(31, 33)]),
-    ]
-    impact = change["reels"][0]
-    assert (impact["clips_removed"], impact["pieces_trimmed"], impact["pieces_removed"]) == (0, 0, 0)  # fmt: skip
+    # The reel is untouched: the first part kept rally a's id, so its labels hold
+    assert reel_segments(client, h, video[0]) == [(a, 10, 12), (a, 13, 17), (b, 31, 33)]  # fmt: skip
 
     logs = corrections(db, video[0])
     assert [(c.action, c.rally_id, c.result_rally_id, c.edited_start, c.edited_end) for c in logs] == [
@@ -353,7 +334,7 @@ def test_merge_rallies(
     normal_user_token_headers: dict[str, str],
 ) -> None:
     h, (a, b, c) = normal_user_token_headers, video[1]
-    make_reel(client, h, video[0], [(a, [(15, 21)]), (b, [(29, 33)]), (c, [(61, 62)])])
+    make_reel(client, h, video[0], [(a, 15, 21), (b, 29, 33), (c, 61, 62)])
     # Either order
     r = client.post(url(video[0], "/merge"), headers=h, json={"rally_ids": [b, a]})
     assert r.status_code == 200, r.text
@@ -362,11 +343,8 @@ def test_merge_rallies(
     assert merged not in (a, b)
     assert change["deleted"] == sorted([a, b])
     assert spans(change) == [(1, 10, 45), (2, 60, 70)]
-    # Back-to-back clips of the two became one clip of the merged rally
-    assert reel_clips(client, h, video[0]) == [
-        (merged, [(15, 21), (29, 33)]),
-        (c, [(61, 62)]),
-    ]
+    # Both old rallies are gone: their segments still play, unlabelled
+    assert reel_segments(client, h, video[0]) == [(None, 15, 21), (None, 29, 33), (c, 61, 62)]  # fmt: skip
 
     logs = corrections(db, video[0])
     assert [(x.action, x.rally_id, x.result_rally_id, x.original_start, x.original_end) for x in logs] == [

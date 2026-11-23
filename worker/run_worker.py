@@ -637,9 +637,12 @@ def serve_forever(
     engine: Engine = default_engine,
     heartbeat_seconds: float = HEARTBEAT_SECONDS,
     renderer: ExportRenderer = render_export,
+    wait: Callable[[float], None] = time.sleep,
 ) -> None:
     """Process jobs until Ctrl+C (or one job with once=True). Nothing a job does
-    stops the loop; only Ctrl+C does."""
+    stops the loop; only Ctrl+C does. wait(seconds): how it waits for new jobs
+    (tests pass their own, rather than patching time.sleep, which subprocess uses
+    while ffmpeg/ffprobe run)."""
     try:
         while True:
             try:
@@ -663,7 +666,7 @@ def serve_forever(
             if once and did_work:
                 break
             if not did_work:
-                time.sleep(poll_seconds)
+                wait(poll_seconds)
     except KeyboardInterrupt:
         logger.info("Worker stopped")
 
