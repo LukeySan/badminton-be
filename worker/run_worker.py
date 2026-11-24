@@ -1,8 +1,8 @@
 """
 Worker loop: takes queued jobs from the database: reel exports (rendered with
 ffmpeg, worker/reel_export.py) first, because they are short, then videos (rally
-analysis). On macOS, put FriBiDi on the library path first (Thai captions need it,
-see worker/caption_image.py; the worker won't start without it):
+analysis). On macOS, put FriBiDi on the library path first (Thai text overlays need
+it, see worker/caption_image.py; the worker won't start without it):
 
     export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
     uv run --package worker python worker/run_worker.py               # run until Ctrl+C
@@ -552,7 +552,7 @@ def run_export(
 
 
 TEXT_LAYOUT_HELP = (
-    "Pillow has no complex text layout (raqm), which Thai captions need. Install "
+    "Pillow has no complex text layout (raqm), which Thai text overlays need. Install "
     "FriBiDi: on macOS `brew install fribidi` and start the worker with "
     "DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib; on "
     "Linux `apt install libfribidi0`."
@@ -582,7 +582,7 @@ def main() -> None:
     )
 
     worker_name = f"{socket.gethostname()}:{os.getpid()}"
-    # Exports with Thai captions would render wrongly without it: refuse to start
+    # Exports with Thai text would render wrongly without it: refuse to start
     if not caption_image.check_text_layout():
         logger.error("Not starting: %s", TEXT_LAYOUT_HELP)
         sys.exit(1)

@@ -4,48 +4,28 @@ stored with it (Export.snapshot): later reel edits or rally fixes don't change a
 export that is queued or running. Pure: no database, no files.
 
 The reel's segments in order, each cut to the video (the app may have measured its
-duration a little differently), slow-mo ones at half speed (twice as long). Captions
-are mapped onto the output timeline: shown while the source time is inside
-[start, end), in every segment that shows it (a replay shows it again), doubled
-inside slow-mo segments; where captions overlap, the first in the list wins, like
-the app.
+duration a little differently), slow-mo ones at half speed (twice as long).
+Overlays are already on the reel's timeline; they keep their list order (drawing
+order) and are mapped onto the output's timeline, which differs from the reel's only
+where a segment was cut at the video's end (then everything after it moves up by the
+cut, at most TRIM_TOLERANCE).
 """
 
-from collections.abc import Iterable
-
 from app.models import (
-    Caption,
-    ExportCaption,
+    SLOW_MO_FACTOR,
     ExportSegment,
     ExportSnapshot,
+    ExportTextOverlay,
+    Overlay,
     ReelEdit,
     ReelFormat,
 )
 
-SLOW_MO_FACTOR = 2.0  # slow-mo = half speed = twice as long
-
-Span = tuple[float, float]
+MIN_OUTPUT_OVERLAY = 0.01  # seconds: shorter than a frame isn't drawn
 
 
 def _round(t: float) -> float:
     return round(t, 3)
-
-
-def subtract(span: Span, holes: Iterable[Span]) -> list[Span]:
-    """The parts of `span` outside all `holes`."""
-    parts = [span]
-    for h_start, h_end in holes:
-        next_parts = []
-        for start, end in parts:
-            if h_end <= start or end <= h_start:
-                next_parts.append((start, end))
-                continue
-            if start < h_start:
-                next_parts.append((start, h_start))
-            if h_end < end:
-                next_parts.append((h_end, end))
-        parts = next_parts
-    return parts
 
 
 def output_length(segment: ExportSegment) -> float:
@@ -53,61 +33,73 @@ def output_length(segment: ExportSegment) -> float:
     return (segment.end - segment.start) * factor
 
 
-def build_segments(edit: ReelEdit, duration: float | None) -> list[ExportSegment]:
+def build_segments(
+    edit: ReelEdit, duration: float | None
+) -> tuple[list[ExportSegment], list[tuple[float, float, float]]]:
+    """The output's segments, and for each segment of the reel (reel start, reel
+    length, output length) to map reel time to output time."""
     limit = float("inf") if duration is None else duration
-    segments = []
+    segments: list[ExportSegment] = []
+    timeline: list[tuple[float, float, float]] = []
+    reel_position = 0.0
     for segment in edit.segments:
         start, end = max(0.0, segment.start), min(segment.end, limit)
+        out_length = 0.0
         if end > start:
-            segments.append(
-                ExportSegment(
-                    start=_round(start),
-                    end=_round(end),
-                    slow_mo=segment.slow_mo,
-                    rally_id=segment.rally_id,
-                )
+            exported = ExportSegment(
+                start=_round(start),
+                end=_round(end),
+                slow_mo=segment.slow_mo,
+                rally_id=segment.rally_id,
             )
-    return segments
+            segments.append(exported)
+            out_length = output_length(exported)
+        timeline.append((reel_position, segment.reel_length, out_length))
+        reel_position += segment.reel_length
+    return segments, timeline
 
 
-def map_captions(
-    captions: list[Caption], segments: list[ExportSegment]
-) -> list[ExportCaption]:
-    out: list[ExportCaption] = []
-    position = 0.0  # where the segment starts in the output
-    for segment in segments:
-        factor = SLOW_MO_FACTOR if segment.slow_mo else 1.0
-        taken: list[Span] = []  # source time already captioned in this segment
-        for caption in captions:
-            span = (max(caption.start, segment.start), min(caption.end, segment.end))
-            if span[1] <= span[0]:
-                continue
-            for start, end in subtract(span, taken):
-                out_start = _round(position + (start - segment.start) * factor)
-                out_end = _round(position + (end - segment.start) * factor)
-                if out_end - out_start < 0.01:  # under a frame
-                    continue
-                last = out[-1] if out else None
-                if last and last.text == caption.text and last.end == out_start:
-                    last.end = out_end  # continues across a segment boundary
-                else:
-                    out.append(
-                        ExportCaption(text=caption.text, start=out_start, end=out_end)
-                    )
-            taken.append(span)
-        position += output_length(segment)
-    return sorted(out, key=lambda c: c.start)
+def to_output_time(t: float, timeline: list[tuple[float, float, float]]) -> float:
+    """Reel time -> output time (inside a cut-short segment, its last frame)."""
+    out_position = 0.0
+    for reel_start, reel_length, out_length in timeline:
+        if t < reel_start + reel_length:
+            return out_position + min(max(t - reel_start, 0.0), out_length)
+        out_position += out_length
+    return out_position
+
+
+def map_overlays(
+    overlays: list[Overlay], timeline: list[tuple[float, float, float]]
+) -> list[ExportTextOverlay]:
+    out: list[ExportTextOverlay] = []
+    for overlay in overlays:
+        start = _round(to_output_time(overlay.start, timeline))
+        end = _round(to_output_time(overlay.end, timeline))
+        if end - start < MIN_OUTPUT_OVERLAY:
+            continue
+        out.append(
+            ExportTextOverlay(
+                text=overlay.text,
+                start=start,
+                end=end,
+                x=overlay.x,
+                y=overlay.y,
+                size=overlay.size,
+            )
+        )
+    return out
 
 
 def build_snapshot(
     edit: ReelEdit, *, duration: float | None, format: ReelFormat | None = None
 ) -> ExportSnapshot:
     """duration: the video's, to cut segments that end a little past it. format:
-    None = the reel's."""
-    segments = build_segments(edit, duration)
+    None = the reel's (overlay positions are fractions, so they work in either)."""
+    segments, timeline = build_segments(edit, duration)
     return ExportSnapshot(
         format=format or edit.format,
         segments=segments,
-        captions=map_captions(edit.captions, segments),
+        overlays=map_overlays(edit.overlays, timeline),
         duration=_round(sum(output_length(s) for s in segments)),
     )

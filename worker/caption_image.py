@@ -1,7 +1,18 @@
 """
-Caption images for exported reels (worker/reel_export.py overlays them with ffmpeg),
-styled like the app's caption: Manrope ExtraBold, light text on a dark box with
-rounded corners (75% opaque), centred near the bottom.
+Text overlay images for exported reels (worker/reel_export.py overlays them with
+ffmpeg), styled like the app's captions: Manrope ExtraBold, light text on a dark
+box with rounded corners (75% opaque).
+
+Geometry (the app's preview must match): font size = overlay size x output height;
+box padding PAD_X / PAD_Y ems, corner radius RADIUS ems, LINE_GAP ems between
+lines; the text wraps to fit the frame minus the safe margins, where ICU's line
+breaking allows (wrap_lines: Unicode line breaking, with dictionary word breaks for
+Thai, which has no spaces, as browsers do for CSS); a word too wide for a line of
+its own breaks between characters (CSS `overflow-wrap: anywhere`); the box is
+centred on (x, y) and then moved inside the safe margin (SAFE_MARGIN of the shorter
+side, on every edge). The line breaks are checked against the browser's
+(Intl.Segmenter) with a fixture shared with the frontend:
+backend/tests/fixtures/line_breaks/.
 
 Pillow, not ffmpeg's drawtext: Homebrew's ffmpeg is built without libfreetype, and
 Pillow draws real rounded corners. Fonts are bundled (worker/fonts/, OFL):
@@ -14,14 +25,19 @@ correctly). Pillow's wheels include raqm but load FriBiDi at runtime:
           DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
   Linux:  apt install libfribidi0 (ffmpeg's packages usually bring it)
 check_text_layout() reports whether it's available; the worker won't start without.
+
+Line and character breaks come from ICU through PyICU, which is built from source
+against the system's ICU (macOS: brew install icu4c pkgconf; Linux: apt install
+libicu-dev pkg-config; see the README).
 """
 
 import functools
 import os
 import struct
-import unicodedata
+from collections.abc import Callable
 from typing import NamedTuple
 
+import icu  # PyICU
 from PIL import Image, ImageDraw, ImageFont, features
 
 FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
@@ -32,18 +48,15 @@ FONT_FILES = ["Manrope-ExtraBold.ttf", "NotoSansThai-ExtraBold.ttf"]
 TEXT_COLOR = (0xDE, 0xFF, 0xF2, 255)
 BOX_COLOR = (0x19, 0x19, 0x23, round(0.75 * 255))
 
-# Sizes relative to the output's shorter side, so 720p and 1080p look the same
-FONT_SIZE = 0.044  # 32 px at 720p (the app: 14 px on a ~320-px-tall player)
 PAD_X, PAD_Y, RADIUS = 0.7, 0.3, 0.5  # in ems, like px-2.5 py-1 rounded-[8px]
 LINE_GAP = 0.1  # ems between lines
-MAX_WIDTH = 0.84  # of the frame width: inside the title-safe area
-# Bottom margin, as a share of the height: 9:16 leaves room for the buttons and
-# text that Reels / TikTok / Shorts draw over the bottom of the video
-BOTTOM_MARGIN = {"16:9": 0.09, "9:16": 0.17}
-MIN_SCALE = 0.6  # shrink long captions down to 60% before breaking words
+# Overlays stay this far from every edge (fraction of the output's shorter side:
+# 22 px at 720p, 32 px at 1080p, the same in 16:9 and 9:16)
+SAFE_MARGIN = 0.03
+MIN_FONT_PX = 8
 SUPERSAMPLE = 4  # the box is drawn larger and scaled down: smooth corners
 
-# Scripts that need shaping (raqm) to look right; a caption with any of these
+# Scripts that need shaping (raqm) to look right; text with any of these
 # characters is refused without it rather than rendered wrong
 COMPLEX_RANGES = [(0x0E00, 0x0E7F)]  # Thai
 
@@ -122,18 +135,30 @@ def _font(name: str, size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.truetype(os.path.join(FONTS_DIR, name), size, layout_engine=engine)
 
 
+def _split(text: str, breaks: icu.BreakIterator) -> list[str]:
+    """Cut text at an ICU break iterator's boundaries. ICU counts in UTF-16 code
+    units, so the cutting is done on its own string type (right for characters
+    outside the BMP too)."""
+    if not text:
+        return []
+    utf16 = icu.UnicodeString(text)
+    breaks.setText(utf16)
+    bounds = [0, *breaks]
+    return [str(utf16[a:b]) for a, b in zip(bounds, bounds[1:], strict=False)]
+
+
 def clusters(text: str) -> list[str]:
-    """Split into user-perceived characters: a base and the marks that follow it
-    (Thai vowels above/below and tone marks are combining marks), so a line break
-    or a font change never separates them."""
-    out: list[str] = []
-    for ch in text:
-        joins = unicodedata.category(ch).startswith("M") or ch in "‍️"
-        if out and joins:
-            out[-1] += ch
-        else:
-            out.append(ch)
-    return out
+    """Split into user-perceived characters (grapheme clusters, ICU): a base and
+    the marks that follow it (Thai vowels above/below, tone marks, SARA AM), so a
+    line break or a font change never separates them."""
+    return _split(text, icu.BreakIterator.createCharacterInstance(icu.Locale.getRoot()))
+
+
+def line_pieces(text: str) -> list[str]:
+    """The text cut where a line may break (ICU: Unicode line breaking, plus
+    dictionary word breaks for Thai): each piece ends with the spaces and
+    punctuation that may not start a line, e.g. "Rally ", "5 ", "สุด", "ยอด!"."""
+    return _split(text, icu.BreakIterator.createLineInstance(icu.Locale.getRoot()))
 
 
 class Run(NamedTuple):
@@ -180,97 +205,113 @@ def _width(runs: list[Run], size: int) -> float:
     return sum(_font(r.font, size).getlength(r.text) for r in runs)
 
 
-def _wrap(text: str, size: int, max_width: float) -> list[str] | None:
-    """Greedy word wrap; None if a single word doesn't fit."""
+def wrap_lines(text: str, width: Callable[[str], float], max_width: float) -> list[str]:
+    """Greedy fill at the line break opportunities (line_pieces), like CSS with
+    `overflow-wrap: anywhere`: trailing spaces don't count towards a line's width;
+    a piece too wide for a line of its own starts a new line and breaks between
+    clusters. `width` measures a string (pixels for drawing; the shared fixture's
+    test uses characters)."""
     lines: list[str] = []
-    for word in text.split():
-        candidate = f"{lines[-1]} {word}" if lines else word
-        if lines and _width(font_runs(candidate), size) <= max_width:
-            lines[-1] = candidate
-        elif _width(font_runs(word), size) <= max_width:
-            lines.append(word)
-        else:
-            return None
-    return lines
+    current = ""
+    for piece in line_pieces(text):
+        if current and width((current + piece).rstrip()) <= max_width:
+            current += piece
+            continue
+        if current:
+            lines.append(current)
+        current = ""
+        if width(piece.rstrip()) <= max_width:
+            current = piece
+            continue
+        for cluster in clusters(piece):
+            if current.strip() and width((current + cluster).rstrip()) > max_width:
+                lines.append(current)
+                current = cluster
+            else:
+                current += cluster
+    if current:
+        lines.append(current)
+    return [line.rstrip() for line in lines if line.strip()]
 
 
-def _break_clusters(text: str, size: int, max_width: float) -> list[str]:
-    """Last resort (e.g. a long Thai phrase without spaces): break anywhere between
-    clusters."""
-    lines = [""]
-    for cluster in clusters(text):
-        if lines[-1] and _width(font_runs(lines[-1] + cluster), size) > max_width:
-            lines.append(cluster.lstrip())
-        else:
-            lines[-1] += cluster
-    return [line.strip() for line in lines if line.strip()]
+def wrap(text: str, size: int, max_width: float) -> list[str]:
+    """Lines of `text` drawn at font size `size` (px), each at most max_width px."""
+    return wrap_lines(text, lambda line: _width(font_runs(line), size), max_width)
 
 
-def layout(text: str, frame_w: int, frame_h: int) -> tuple[int, list[str]]:
-    """Font size and lines: wrap at spaces into at most 2 lines, shrinking the text
-    (down to MIN_SCALE) until it fits; then break between characters."""
-    base = round(min(frame_w, frame_h) * FONT_SIZE)
-    for scale in (1.0, 0.9, 0.8, 0.7, MIN_SCALE):
-        size = max(8, round(base * scale))
-        max_width = frame_w * MAX_WIDTH - 2 * PAD_X * size
-        lines = _wrap(text, size, max_width)
-        if lines is not None and len(lines) <= 2:
-            return size, lines
-    size = max(8, round(base * MIN_SCALE))
-    return size, _break_clusters(text, size, frame_w * MAX_WIDTH - 2 * PAD_X * size)
+def safe_margin(frame_w: int, frame_h: int) -> int:
+    return round(min(frame_w, frame_h) * SAFE_MARGIN)
 
 
-class CaptionImage(NamedTuple):
+def place(centre: float, length: int, frame: int, margin: int) -> int:
+    """Top-left coordinate along one axis: centred on `centre` (pixels), moved
+    inside the margins; a box larger than the room between them is centred."""
+    if length > frame - 2 * margin:
+        return (frame - length) // 2
+    return min(max(round(centre - length / 2), margin), frame - margin - length)
+
+
+class OverlayImage(NamedTuple):
     image: Image.Image  # RGBA, the box with the text
     x: int  # where it goes in the frame (top-left)
     y: int
 
 
-def render_caption(
-    text: str, frame_w: int, frame_h: int, fmt: str
-) -> CaptionImage | None:
-    """The caption's image and position; None if nothing drawable is left (e.g. a
-    caption that is only emoji)."""
+def render_text_overlay(
+    text: str, frame_w: int, frame_h: int, x: float, y: float, size: float
+) -> OverlayImage | None:
+    """A text overlay's image and position in a frame_w x frame_h output: font size
+    `size` x frame height, centred on (x, y) (fractions of the frame), kept inside
+    the safe margin. None if nothing drawable is left (e.g. only emoji)."""
     text = drop_unsupported(text)
     if not text:
         return None
     if needs_complex_layout(text) and not check_text_layout():
         raise RuntimeError(
-            "This caption needs complex text layout (raqm) and Pillow doesn't have "
-            "it: install FriBiDi (see worker/caption_image.py)"
+            "This text needs complex text layout (raqm) and Pillow doesn't have it: "
+            "install FriBiDi (see worker/caption_image.py)"
         )
-    size, lines = layout(text, frame_w, frame_h)
+    font_px = max(MIN_FONT_PX, round(size * frame_h))
+    margin = safe_margin(frame_w, frame_h)
+    pad_x, pad_y = round(PAD_X * font_px), round(PAD_Y * font_px)
+    lines = wrap(text, font_px, frame_w - 2 * margin - 2 * pad_x)
     line_runs = [font_runs(line) for line in lines]
-    metrics = [[_font(r.font, size).getmetrics() for r in runs] for runs in line_runs]
+    metrics = [
+        [_font(r.font, font_px).getmetrics() for r in runs] for runs in line_runs
+    ]
     ascents = [max(a for a, _ in m) for m in metrics]
     descents = [max(d for _, d in m) for m in metrics]
-    gap = round(LINE_GAP * size)
+    gap = round(LINE_GAP * font_px)
     text_h = sum(ascents) + sum(descents) + gap * (len(lines) - 1)
-    widths = [_width(runs, size) for runs in line_runs]
-    pad_x, pad_y = round(PAD_X * size), round(PAD_Y * size)
+    widths = [_width(runs, font_px) for runs in line_runs]
     box_w = round(max(widths)) + 2 * pad_x
     box_h = text_h + 2 * pad_y
 
     big = Image.new("RGBA", (box_w * SUPERSAMPLE, box_h * SUPERSAMPLE), (0, 0, 0, 0))
     ImageDraw.Draw(big).rounded_rectangle(
         (0, 0, big.width - 1, big.height - 1),
-        radius=round(RADIUS * size * SUPERSAMPLE),
+        radius=round(RADIUS * font_px * SUPERSAMPLE),
         fill=BOX_COLOR,
     )
     image = big.resize((box_w, box_h), Image.Resampling.LANCZOS)
     draw = ImageDraw.Draw(image)
-    y = pad_y
+    top = pad_y
     for runs, width, ascent, descent in zip(
         line_runs, widths, ascents, descents, strict=True
     ):
-        x = (box_w - width) / 2
-        baseline = y + ascent
+        left = (box_w - width) / 2
+        baseline = top + ascent
         for run in runs:
-            font = _font(run.font, size)
+            font = _font(run.font, font_px)
             # Left-baseline anchor: Manrope and Noto Sans Thai share the baseline
-            draw.text((x, baseline), run.text, font=font, fill=TEXT_COLOR, anchor="ls")
-            x += font.getlength(run.text)
-        y += ascent + descent + gap
+            draw.text(
+                (left, baseline), run.text, font=font, fill=TEXT_COLOR, anchor="ls"
+            )
+            left += font.getlength(run.text)
+        top += ascent + descent + gap
 
-    margin = round(frame_h * BOTTOM_MARGIN.get(fmt, BOTTOM_MARGIN["16:9"]))
-    return CaptionImage(image, (frame_w - box_w) // 2, frame_h - margin - box_h)
+    return OverlayImage(
+        image,
+        place(x * frame_w, box_w, frame_w, margin),
+        place(y * frame_h, box_h, frame_h, margin),
+    )

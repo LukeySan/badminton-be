@@ -2,7 +2,7 @@
 Render an export into an MP4 with ffmpeg, from the ORIGINAL upload (not the
 512x288 analysis copy). What to render is the export's snapshot (built by the API,
 backend/app/export_snapshot.py): segments of the original in output order, each
-normal speed or slow-mo, and captions already on the output timeline.
+normal speed or slow-mo, and text overlays already on the output timeline.
 
 One ffmpeg run:
 - the original is opened once per segment with input seeking (-ss/-t before -i):
@@ -12,13 +12,15 @@ One ffmpeg run:
   output size (16:9: scaled, letterboxed if the original isn't 16:9, so the court is
   never cut; 9:16: centre crop, then scaled);
 - concat filter joins them in order, video and audio together;
-- captions (PNG images from caption_image.py) overlaid while they're on;
+- text overlays (PNG images from caption_image.py, sized for this output and
+  placed at their centre inside the safe margin) overlaid while they're on, in list
+  order (later ones on top);
 - H.264 (CRF 20, yuv420p, +faststart) and AAC.
 No -r and no fps filter: frames keep their own timestamps (-fps_mode passthrough),
 so variable-frame-rate phone video keeps its timing (forcing a rate on phone video
 broke timestamps before). Progress comes from ffmpeg's -progress output.
 
-Standard library + ffmpeg + Pillow (captions), so the backend's tests can run it.
+Standard library + ffmpeg + Pillow (overlays), so the backend's tests can run it.
 """
 
 import json
@@ -86,10 +88,11 @@ def build_command(
     width: int,
     height: int,
     has_audio: bool,
-    captions: list[tuple[str, int, int, float, float]],
+    overlays: list[tuple[str, int, int, float, float]],
     out_path: str,
 ) -> list[str]:
-    """captions: (png path, x, y, start, end) on the output timeline."""
+    """overlays: (png path, x, y, start, end) on the output timeline, top-left
+    corner in pixels; drawn in this order (later on top)."""
     segments = snapshot["segments"]
     fit = fit_filter(snapshot["format"], width, height)
     inputs: list[str] = []
@@ -114,14 +117,14 @@ def build_command(
     pairs = "".join(f"[v{i}][a{i}]" for i in range(len(segments)))
     graph.append(f"{pairs}concat=n={len(segments)}:v=1:a=1[vcat][aout]")
     current = "vcat"
-    for k, (png, x, y, start, end) in enumerate(captions):
+    for k, (png, x, y, start, end) in enumerate(overlays):
         inputs += ["-i", png]
         on = f"gte(t\\,{start:.3f})*lt(t\\,{end:.3f})"
         graph.append(
             f"[{current}][{len(segments) + k}:v]overlay=x={x}:y={y}"
-            f":enable='{on}':eof_action=repeat[c{k}]"
+            f":enable='{on}':eof_action=repeat[o{k}]"
         )
-        current = f"c{k}"
+        current = f"o{k}"
     graph.append(f"[{current}]format=yuv420p[vout]")
     return [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
@@ -163,6 +166,30 @@ def run_ffmpeg(
             raise RenderFailed(f"ffmpeg exited with {code}: {tail}")
 
 
+def overlay_images(
+    snapshot: dict[str, Any], width: int, height: int, work: str
+) -> list[tuple[str, int, int, float, float]]:
+    """Each drawable overlay as a PNG in `work`: (path, x, y, start, end). Types
+    this worker doesn't know (e.g. a future "score") are skipped, as is text with
+    nothing drawable left."""
+    out = []
+    for k, overlay in enumerate(snapshot.get("overlays", [])):
+        if overlay.get("type") != "text":
+            continue
+        image = caption_image.render_text_overlay(
+            overlay["text"], width, height,
+            float(overlay["x"]), float(overlay["y"]), float(overlay["size"]),
+        )  # fmt: skip
+        if image is None:
+            continue
+        png = os.path.join(work, f"overlay_{k:03d}.png")
+        image.image.save(png)
+        out.append(
+            (png, image.x, image.y, float(overlay["start"]), float(overlay["end"]))
+        )
+    return out
+
+
 def render_export(
     source: str,
     snapshot: dict[str, Any],
@@ -179,24 +206,13 @@ def render_export(
     work = tempfile.mkdtemp(prefix="export-", dir=os.path.dirname(out_path))
     partial = out_path + ".part"
     try:
-        captions = []
-        for k, caption in enumerate(snapshot.get("captions", [])):
-            image = caption_image.render_caption(
-                caption["text"], width, height, snapshot["format"]
-            )
-            if image is None:
-                continue
-            png = os.path.join(work, f"caption_{k:03d}.png")
-            image.image.save(png)
-            captions.append(
-                (png, image.x, image.y, float(caption["start"]), float(caption["end"]))
-            )
+        overlays = overlay_images(snapshot, width, height, work)
         command = build_command(
-            source, snapshot, width, height, info["has_audio"], captions, partial
+            source, snapshot, width, height, info["has_audio"], overlays, partial
         )
         log(
             f"rendering {len(snapshot['segments'])} segments, "
-            f"{len(captions)} captions, {snapshot['duration']:.1f} s, {width}x{height}"
+            f"{len(overlays)} overlays, {snapshot['duration']:.1f} s, {width}x{height}"
         )
         run_ffmpeg(command, float(snapshot["duration"]), on_progress)
         rendered = probe(partial)

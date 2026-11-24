@@ -1,0 +1,116 @@
+{
+  "about": "Thai line breaks for text overlays, from Intl.Segmenter (frontend src/components/Reels/lineBreaks.fixtures.test.ts). pieces: the text cut where a line may break (each word with the spaces and punctuation after it). lines: greedy wrap at max_width, measured in characters that take space (not \\p{Mn}), trailing spaces not counted; a piece wider than a line breaks between grapheme clusters. The backend checks the same file against PyICU (worker/caption_image.py).",
+  "cases": [
+    {
+      "name": "one-phrase",
+      "text": "ลูกนี้สุดยอดมาก",
+      "max_width": 6,
+      "pieces": ["ลูก", "นี้", "สุด", "ยอด", "มาก"],
+      "lines": ["ลูกนี้สุด", "ยอดมาก"]
+    },
+    {
+      "name": "smash",
+      "text": "ตบหนักมากจนคู่แข่งรับไม่ทัน",
+      "max_width": 8,
+      "pieces": ["ตบ", "หนัก", "มาก", "จน", "คู่", "แข่ง", "รับ", "ไม่ทัน"],
+      "lines": ["ตบหนักมาก", "จนคู่แข่งรับ", "ไม่ทัน"]
+    },
+    {
+      "name": "last-point",
+      "text": "แต้มสุดท้ายของเกมที่สาม",
+      "max_width": 9,
+      "pieces": ["แต้ม", "สุดท้าย", "ของ", "เกม", "ที่", "สาม"],
+      "lines": ["แต้มสุดท้าย", "ของเกมที่", "สาม"]
+    },
+    {
+      "name": "mixed-latin",
+      "text": "Rally 5 สุดยอด!",
+      "max_width": 7,
+      "pieces": ["Rally ", "5 ", "สุด", "ยอด!"],
+      "lines": ["Rally 5", "สุดยอด!"]
+    },
+    {
+      "name": "serve",
+      "text": "เสิร์ฟสั้นแล้วดาดหลังทันที",
+      "max_width": 10,
+      "pieces": ["เสิร์ฟ", "สั้น", "แล้ว", "ดาด", "หลัง", "ทันที"],
+      "lines": ["เสิร์ฟสั้นแล้ว", "ดาดหลังทันที"]
+    },
+    {
+      "name": "space-and-punctuation",
+      "text": "ชนะแล้ว! เกมตัดสินสนุกมาก",
+      "max_width": 9,
+      "pieces": ["ชนะ", "แล้ว! ", "เกม", "ตัดสิน", "สนุก", "มาก"],
+      "lines": ["ชนะแล้ว!", "เกมตัดสิน", "สนุกมาก"]
+    },
+    {
+      "name": "two-phrases",
+      "text": "ตีโต้กันยาวที่สุดในวันนี้ เหนื่อยแต่สนุก",
+      "max_width": 12,
+      "pieces": [
+        "ตีโต้",
+        "กัน",
+        "ยาว",
+        "ที่สุด",
+        "ใน",
+        "วัน",
+        "นี้ ",
+        "เหนื่อย",
+        "แต่",
+        "สนุก"
+      ],
+      "lines": ["ตีโต้กันยาวที่สุด", "ในวันนี้ เหนื่อย", "แต่สนุก"]
+    },
+    {
+      "name": "mai-yamok",
+      "text": "หยอดหน้าเน็ตสวยงามมากจริงๆ",
+      "max_width": 8,
+      "pieces": ["หยอด", "หน้า", "เน็ต", "สวยงาม", "มาก", "จริงๆ"],
+      "lines": ["หยอดหน้า", "เน็ต", "สวยงาม", "มากจริงๆ"]
+    },
+    {
+      "name": "word-wider-than-a-line",
+      "text": "แบดมินตันประเภทคู่ผสม",
+      "max_width": 5,
+      "pieces": ["แบดมินตัน", "ประเภท", "คู่ผสม"],
+      "lines": ["แบดมิน", "ตัน", "ประเภ", "ทคู่ผสม"]
+    },
+    {
+      "name": "80-characters",
+      "text": "ลูกนี้สุดยอดมากลูกนี้สุดยอดมากลูกนี้สุดยอดมากลูกนี้สุดยอดมากลูกนี้สุดยอดมาก",
+      "max_width": 20,
+      "pieces": [
+        "ลูก",
+        "นี้",
+        "สุด",
+        "ยอด",
+        "มาก",
+        "ลูก",
+        "นี้",
+        "สุด",
+        "ยอด",
+        "มาก",
+        "ลูก",
+        "นี้",
+        "สุด",
+        "ยอด",
+        "มาก",
+        "ลูก",
+        "นี้",
+        "สุด",
+        "ยอด",
+        "มาก",
+        "ลูก",
+        "นี้",
+        "สุด",
+        "ยอด",
+        "มาก"
+      ],
+      "lines": [
+        "ลูกนี้สุดยอดมากลูกนี้สุดยอด",
+        "มากลูกนี้สุดยอดมากลูกนี้สุด",
+        "ยอดมากลูกนี้สุดยอดมาก"
+      ]
+    }
+  ]
+}

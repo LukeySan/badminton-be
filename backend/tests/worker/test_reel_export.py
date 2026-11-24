@@ -1,6 +1,7 @@
 """worker/reel_export.py and worker/caption_image.py with real ffmpeg on small
 generated videos: durations (slow-mo counts double), sizes per format and quality,
-audio, variable frame rate, captions (incl. Thai)."""
+audio, variable frame rate, text overlays (position and size checked on grabbed
+frames, Thai)."""
 
 import json
 import os
@@ -88,13 +89,25 @@ def seg(
 def snapshot(
     segments: list[dict[str, Any]],
     fmt: str = "16:9",
-    captions: list[dict[str, Any]] | None = None,
+    overlays: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     duration = sum(
         (s["end"] - s["start"]) * (2 if s["slow_mo"] else 1) for s in segments
     )
-    return {"version": 1, "format": fmt, "segments": segments,
-            "captions": captions or [], "duration": round(duration, 3)}  # fmt: skip
+    return {"version": 2, "format": fmt, "segments": segments,
+            "overlays": overlays or [], "duration": round(duration, 3)}  # fmt: skip
+
+
+def text(
+    value: str,
+    start: float,
+    end: float,
+    x: float = 0.5,
+    y: float = 0.85,
+    size: float = 0.06,
+) -> dict[str, Any]:
+    return {"type": "text", "text": value, "start": start, "end": end, "x": x,
+            "y": y, "size": size}  # fmt: skip
 
 
 def render(
@@ -136,7 +149,7 @@ def test_duration_size_and_audio(
     assert abs(float(audio["duration"]) - float(video["duration"])) < 0.1
     assert result == {"duration": info["duration"], "size_bytes": out.stat().st_size}
     assert not Path(str(out) + ".part").exists()
-    assert os.listdir(tmp_path) == ["e.mp4"]  # no caption or work files left over
+    assert os.listdir(tmp_path) == ["e.mp4"]  # no overlay or work files left over
 
 
 def test_variable_frame_rate_is_kept(vfr_source: Path, tmp_path: Path) -> None:
@@ -205,30 +218,127 @@ def frame_region(
 
 
 @needs_raqm
-def test_captions_are_burned_in_while_on(vfr_source: Path, tmp_path: Path) -> None:
-    text = "ลูกนี้สุดยอด! Rally 5"
+def test_overlays_are_burned_in_while_on(vfr_source: Path, tmp_path: Path) -> None:
+    value = "ลูกนี้สุดยอด! Rally 5"
     segments = [seg(0.0, 2.0)]
-    plain, captioned = tmp_path / "plain.mp4", tmp_path / "captioned.mp4"
+    plain, with_text = tmp_path / "plain.mp4", tmp_path / "text.mp4"
     render(vfr_source, snapshot(segments), plain)
-    render(vfr_source, snapshot(segments, captions=[{"text": text, "start": 0.2, "end": 1.0}]), captioned)  # fmt: skip
+    render(vfr_source, snapshot(segments, overlays=[text(value, 0.2, 1.0)]), with_text)
 
-    image = caption_image.render_caption(text, 1280, 720, "16:9")
+    image = caption_image.render_text_overlay(value, 1280, 720, 0.5, 0.85, 0.06)
     assert image is not None
     box = (image.x, image.y, image.image.width, image.image.height)
 
     def difference(t: float) -> float:
         a = frame_region(plain, t, box, 1280)
-        b = frame_region(captioned, t, box, 1280)
+        b = frame_region(with_text, t, box, 1280)
         return sum(abs(p - q) for p, q in zip(a, b, strict=True)) / len(a)
 
-    assert difference(0.6) > 20  # the caption box is there
+    assert difference(0.6) > 20  # the box is there
     assert difference(1.5) < 3  # and gone after its end
 
 
-def test_caption_only_emoji_is_skipped(vfr_source: Path, tmp_path: Path) -> None:
+def test_overlay_only_emoji_or_unknown_type_is_skipped(
+    vfr_source: Path, tmp_path: Path
+) -> None:
     out = tmp_path / "e.mp4"
-    render(vfr_source, snapshot([seg(0, 1)], captions=[{"text": "🏸🏸", "start": 0, "end": 1}]), out)  # fmt: skip
+    score = {**text("", 0, 1), "type": "score"}  # reserved: not drawn (yet)
+    snap = snapshot([seg(0, 1)], overlays=[text("🏸🏸", 0, 1), score])
+    assert reel_export.overlay_images(snap, 1280, 720, str(tmp_path)) == []
+    render(vfr_source, snap, out)
     assert probe(out)["video"] is not None
+
+
+def test_overlays_are_drawn_in_list_order() -> None:
+    """Each overlay goes on top of the result so far: later ones on top."""
+    overlays = [("a.png", 10, 20, 0.0, 1.0), ("b.png", 30, 40, 0.5, 1.0)]
+    command = reel_export.build_command(
+        "in.mp4", snapshot([seg(0, 1)]), 1280, 720, True, overlays, "out.mp4"
+    )
+    graph = command[command.index("-filter_complex") + 1]
+    assert "[vcat][1:v]overlay=x=10:y=20" in graph
+    assert "[o0][2:v]overlay=x=30:y=40" in graph
+    assert command.index("a.png") < command.index("b.png")
+
+
+# --- positions and sizes on real frames -----------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def white_source(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Plain white, 16:9 (640x360), 2 s: the dark overlay box stands out."""
+    out = tmp_path_factory.mktemp("white") / "white.mp4"
+    ffmpeg("-f", "lavfi", "-i", "color=c=white:size=640x360:rate=30:duration=2",
+           "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out))  # fmt: skip
+    return out
+
+
+def dark_box(
+    path: Path, t: float, width: int, height: int
+) -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) of the dark pixels in the frame at t: the overlay's
+    box on a white picture (right/bottom exclusive)."""
+    raw = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{t}", "-i", str(path), "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+        capture_output=True, check=True,
+    ).stdout  # fmt: skip
+    dark = bytes(1 if v < 160 else 0 for v in range(256))
+    rows = []
+    left, right = width, 0
+    for row in range(height):
+        line = raw[row * width : (row + 1) * width].translate(dark)
+        first = line.find(1)
+        if first >= 0:
+            rows.append(row)
+            left, right = min(left, first), max(right, line.rfind(1) + 1)
+    assert rows, "no overlay box in the frame"
+    return left, rows[0], right, rows[-1] + 1
+
+
+def one_line_box_height(size: float, frame_h: int) -> int:
+    """A one-line Latin box: font size = size x frame height, plus the padding."""
+    font_px = round(size * frame_h)
+    ascent, descent = ImageFont.truetype(
+        os.path.join(caption_image.FONTS_DIR, "Manrope-ExtraBold.ttf"), font_px
+    ).getmetrics()
+    return ascent + descent + 2 * round(caption_image.PAD_Y * font_px)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "size"),
+    [("16:9", (1280, 720)), ("16:9", (1920, 1080)), ("9:16", (720, 1280)),
+     ("9:16", (1080, 1920))],
+)  # fmt: skip
+def test_overlay_position_and_size_on_the_frame(
+    white_source: Path, tmp_path: Path, fmt: str, size: tuple[int, int]
+) -> None:
+    """Centred on (x, y) as fractions of the output frame, the text as tall as
+    `size` of the frame height, in both formats and qualities; one placed past the
+    corner stays inside the safe margin."""
+    w, h = size
+    out = tmp_path / "e.mp4"
+    snap = snapshot(
+        [seg(0, 1)],
+        fmt,
+        overlays=[
+            text("Nice", 0.0, 0.5, x=0.3, y=0.25, size=0.06),
+            text("Win", 0.5, 1.0, x=1.0, y=1.0, size=0.12),
+        ],
+    )
+    render(white_source, snap, out, size)
+
+    left, top, right, bottom = dark_box(out, 0.25, w, h)
+    assert abs((left + right) / 2 - 0.3 * w) <= 2
+    assert abs((top + bottom) / 2 - 0.25 * h) <= 2
+    assert abs((bottom - top) - one_line_box_height(0.06, h)) <= 2
+
+    left, top, right, bottom = dark_box(out, 0.75, w, h)
+    margin = caption_image.safe_margin(w, h)
+    assert margin == round(min(w, h) * 0.03)
+    assert abs(right - (w - margin)) <= 2  # pushed in from the corner
+    assert abs(bottom - (h - margin)) <= 2
+    assert abs((bottom - top) - one_line_box_height(0.12, h)) <= 2
 
 
 def test_failing_ffmpeg_raises_with_its_message(
@@ -294,7 +404,7 @@ def test_marks_stay_with_their_letter() -> None:
 
 def test_unsupported_characters_are_dropped() -> None:
     assert caption_image.drop_unsupported("Smash 🏸 ok") == "Smash ok"
-    assert caption_image.render_caption("🏸", 1280, 720, "16:9") is None
+    assert caption_image.render_text_overlay("🏸", 1280, 720, 0.5, 0.5, 0.06) is None
 
 
 @needs_raqm
@@ -307,32 +417,62 @@ def test_thai_is_shaped() -> None:
     assert raqm.getbbox("ที่", anchor="ls")[1] < basic.getbbox("ที่", anchor="ls")[1] - 5
 
 
-def test_caption_box_layout() -> None:
-    short = caption_image.render_caption("Nice", 1280, 720, "16:9")
-    assert short is not None
-    # Centred, above the bottom margin (9% of the height for 16:9)
-    assert short.x == (1280 - short.image.width) // 2
-    assert short.y + short.image.height == 720 - round(720 * 0.09)
-    # Corners are transparent (rounded box), the middle is the box colour
-    assert short.image.getpixel((0, 0))[3] == 0  # type: ignore[index]
+def test_text_overlay_layout() -> None:
+    """Font size = size x frame height (the same share of the frame at 720p and
+    1080p); centred on (x, y); rounded transparent corners."""
+    small = caption_image.render_text_overlay("Nice", 1280, 720, 0.5, 0.5, 0.06)
+    large = caption_image.render_text_overlay("Nice", 1920, 1080, 0.5, 0.5, 0.06)
+    assert small is not None and large is not None
+    assert abs(large.image.height / small.image.height - 1.5) < 0.05
+    assert small.x == round(640 - small.image.width / 2)
+    assert small.y == round(360 - small.image.height / 2)
+    assert small.image.getpixel((0, 0))[3] == 0  # type: ignore[index]
+    bigger = caption_image.render_text_overlay("Nice", 1280, 720, 0.5, 0.5, 0.12)
+    assert bigger is not None and bigger.image.height > small.image.height * 1.9
 
-    long_text = "A very long caption that needs to wrap onto two lines nicely ok"
-    wrapped = caption_image.render_caption(long_text, 720, 1280, "9:16")
-    assert wrapped is not None
-    assert wrapped.image.width <= 720 * caption_image.MAX_WIDTH + 1
-    assert wrapped.image.height > short.image.height * 1.5  # two lines
-    # 9:16 leaves more room at the bottom for the social apps' buttons
-    assert wrapped.y + wrapped.image.height == 1280 - round(1280 * 0.17)
+
+def test_long_text_wraps_inside_the_safe_margin() -> None:
+    long_text = "A very long caption that needs to wrap onto several lines nicely"
+    wrapped = caption_image.render_text_overlay(long_text, 720, 1280, 0.5, 0.5, 0.06)
+    one_line = caption_image.render_text_overlay("A", 720, 1280, 0.5, 0.5, 0.06)
+    assert wrapped is not None and one_line is not None
+    margin = caption_image.safe_margin(720, 1280)
+    assert wrapped.image.width <= 720 - 2 * margin
+    assert margin <= wrapped.x and wrapped.x + wrapped.image.width <= 720 - margin
+    assert wrapped.image.height > one_line.image.height * 2  # 3+ lines
+
+
+@pytest.mark.parametrize(
+    ("centre", "length", "frame", "margin", "left"),
+    [
+        (500, 100, 1000, 20, 450),  # centred
+        (10, 100, 1000, 20, 20),  # pushed in at the start
+        (1000, 100, 1000, 20, 880),  # and at the end
+        (500, 980, 1000, 20, 10),  # bigger than the room inside the margins: centred
+    ],
+)
+def test_place(centre: float, length: int, frame: int, margin: int, left: int) -> None:
+    assert caption_image.place(centre, length, frame, margin) == left
 
 
 @needs_raqm
-def test_long_thai_without_spaces_breaks_between_clusters() -> None:
-    # 75 characters (captions go up to 80), no spaces: too long for one line even
-    # at the smallest size, so it breaks between characters
-    text = "ลูกนี้สุดยอดมาก" * 5
-    size, lines = caption_image.layout(text, 720, 1280)
+def test_long_thai_without_spaces_breaks_at_words() -> None:
+    """80 characters, no spaces, at the overlay's size in pixels: lines break
+    between Thai words (ICU's dictionary, like the browser), never inside one.
+    The shared fixture checks the exact breaks (test_line_breaks.py)."""
+    value = "ลูกนี้สุดยอดมาก" * 5
+    lines = caption_image.wrap(value, 77, 600)
     assert len(lines) > 1
-    assert "".join(lines) == text  # nothing lost, no mark split from its letter
+    assert "".join(lines) == value  # nothing lost
+    words = {"ลูก", "นี้", "สุด", "ยอด", "มาก"}
     for line in lines:
-        assert caption_image.clusters(line)[0][0] not in "ัิีึื่้๊๋"
-    assert size < round(720 * caption_image.FONT_SIZE)
+        assert set(caption_image.line_pieces(line)) <= words
+        assert caption_image._width(caption_image.font_runs(line), 77) <= 600
+
+
+def test_a_long_word_starts_its_own_line() -> None:
+    """Like CSS overflow-wrap: anywhere, a word too wide for any line starts on a
+    new line, breaks between characters, and the next word may join its last
+    piece (at 40 px, 10 W's fill a 400 px line)."""
+    lines = caption_image.wrap("Hi " + "W" * 35 + " ok", 40, 400)
+    assert lines == ["Hi", "W" * 10, "W" * 10, "W" * 10, "WWWWW ok"]

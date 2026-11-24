@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from app.export_snapshot import build_snapshot
-from app.models import ReelEdit
+from app.models import ExportSnapshot, ReelEdit
 
 VERSIONS = Path(__file__).resolve().parents[1] / "app" / "alembic" / "versions"
 
@@ -28,6 +28,7 @@ one_reel = load("9bd7ddc4eed1")
 reel_v3 = load("d769f6b0ca89")
 reel_v4 = load("ec4778601b52")
 reel_v5 = load("8f3a5c2d9e14")
+reel_v6 = load("4c1e7a9b2d60")
 
 
 def to_current(v2_edit: dict[str, Any], duration: float = 120.0) -> dict[str, Any]:
@@ -37,7 +38,7 @@ def to_current(v2_edit: dict[str, Any], duration: float = 120.0) -> dict[str, An
 
 
 def v4_to_current(v4_edit: dict[str, Any], duration: float = 120.0) -> dict[str, Any]:
-    return reel_v5.edit_v4_to_v5(v4_edit, RALLIES, duration)
+    return reel_v6.edit_v5_to_v6(reel_v5.edit_v4_to_v5(v4_edit, RALLIES, duration))
 
 
 RALLIES = {1: (10.0, 20.0), 2: (30.0, 45.0)}
@@ -319,12 +320,13 @@ def v4_cases() -> list[Path]:
 def test_v4_reels_become_the_segments_they_played(path: Path) -> None:
     """Each v4 reel plays the same as v5: the segments its Rallies-only playback
     played, in order (restored stretches unlabelled), and its export has the same
-    captions and length."""
+    captions (v5's rule; as text overlays after v6) and length."""
     case = json.loads(path.read_text(encoding="utf-8"))
     rallies = {r["id"]: (r["start"], r["end"]) for r in case["rallies"]}
     new = reel_v5.edit_v4_to_v5(case["edit"], rallies, case["duration"])
-    edit = ReelEdit.model_validate(new)
     expected = case["expected"]
+    assert reel_v6.captions_on_reel_timeline(new) == expected["captions"]
+    edit = ReelEdit.model_validate(reel_v6.edit_v5_to_v6(new))
 
     assert [(s.start, s.end, s.slow_mo) for s in edit.segments] == [
         (e["start"], e["end"], e["slow_mo"]) for e in expected["segments"]
@@ -333,7 +335,8 @@ def test_v4_reels_become_the_segments_they_played(path: Path) -> None:
         e["kind"] == "gap" for e in expected["segments"]
     ]
     snapshot = build_snapshot(edit, duration=case["duration"])
-    assert snapshot.model_dump()["captions"] == expected["captions"]
+    assert [{"text": o.text, "start": o.start, "end": o.end}
+            for o in snapshot.overlays] == expected["captions"]  # fmt: skip
     assert snapshot.duration == expected["duration"]
     assert new["format"] == case["edit"]["format"]
 
@@ -389,7 +392,7 @@ def test_times_go_to_tenths_and_slivers_join_a_neighbour() -> None:
     assert [s["id"] for s in new["segments"]] == ["s1", "s2", "s3"]
     assert new["captions"] == [{"text": "x", "start": 1, "end": 2}]
     assert new["format"] == "9:16"
-    ReelEdit.model_validate(new)
+    ReelEdit.model_validate(reel_v6.edit_v5_to_v6(new))
 
 
 def test_v5_is_left_alone() -> None:
@@ -442,3 +445,168 @@ def test_downgrade_where_possible() -> None:
     assert old["restored_anchors"] == [62]
     assert old["overlays"] == {"trail": False, "captions": v5["captions"]}
     assert all(c["cuts"] == [] for c in old["clips"])
+
+
+# --- v5 -> v6: captions become text overlays on the reel's timeline -------------------
+
+
+def v5(*segments: tuple[float, float, bool], captions: list[Any]) -> dict[str, Any]:
+    return {
+        "version": 5,
+        "format": "9:16",
+        "segments": [
+            {"id": f"s{i}", "start": a, "end": b, "slow_mo": slow, "rally_id": None}
+            for i, (a, b, slow) in enumerate(segments, start=1)
+        ],
+        "captions": captions,
+    }
+
+
+def caption(text: str, start: float, end: float) -> dict[str, Any]:
+    return {"text": text, "start": start, "end": end}
+
+
+def placed(id: str, text: str, start: float, end: float) -> dict[str, Any]:
+    return {"id": id, "type": "text", "text": text, "start": start, "end": end,
+            "x": 0.5, "y": 0.85, "size": 0.06}  # fmt: skip
+
+
+def test_captions_become_overlays_where_v5_showed_them() -> None:
+    """In every segment showing the caption's source time (a replay shows it again),
+    slow-mo counted double, the first caption winning where two overlap, the same
+    text across touching segments one overlay; near the bottom, default size."""
+    old = v5(
+        (9, 14, False),  # reel 0-5
+        (14, 18, True),  # reel 5-13
+        (29, 41, False),  # reel 13-25
+        (12, 14, False),  # reel 25-27: a replay
+        captions=[
+            caption("Huge smash", 12, 16),
+            caption("First", 30, 32),
+            caption("Second", 31, 33),
+            caption("Never shown", 45, 47),
+        ],
+    )
+    new = reel_v6.edit_v5_to_v6(old)
+    assert new == {
+        "version": 6,
+        "format": "9:16",
+        "segments": old["segments"],
+        "overlays": [
+            placed("o1", "Huge smash", 3, 9),  # 12-14 normal, 14-16 slow
+            placed("o2", "First", 14, 16),
+            placed("o3", "Second", 16, 17),
+            placed("o4", "Huge smash", 25, 27),  # the replay
+        ],
+    }
+    edit = ReelEdit.model_validate(new)
+    assert edit.model_dump(mode="json") == new  # valid, and nothing clamped
+
+
+def test_caption_times_go_to_tenths_and_slivers_are_dropped() -> None:
+    """v6 keeps 0.1 s and needs 0.3 s on screen: 3.04 -> 3.0; a caption the reel
+    shows for 0.25 s is dropped (one it doesn't show at all, too)."""
+    old = v5(
+        (10, 13.04, False),  # reel 0-3.04
+        (20, 25, False),  # reel 3.04-8.04
+        captions=[
+            caption("rounded", 11.04, 13.04),
+            caption("sliver", 24.75, 30),  # 0.25 s at the end of the reel
+            caption("touching", 13.04, 20),  # between the two segments: not shown
+        ],
+    )
+    assert reel_v6.edit_v5_to_v6(old)["overlays"] == [placed("o1", "rounded", 1.0, 3.0)]
+
+
+def test_at_most_20_overlays_the_first_ones_in_time() -> None:
+    old = v5(
+        (0, 100, False),
+        captions=[caption(f"c{n}", n, n + 0.5) for n in range(30, 0, -1)],
+    )
+    overlays = reel_v6.edit_v5_to_v6(old)["overlays"]
+    assert len(overlays) == 20
+    assert [o["text"] for o in overlays] == [f"c{n}" for n in range(1, 21)]
+    assert [o["id"] for o in overlays] == [f"o{n}" for n in range(1, 21)]
+    ReelEdit.model_validate(reel_v6.edit_v5_to_v6(old))
+
+
+def test_v6_is_left_alone_and_v5_not_downgraded_again() -> None:
+    already = ReelEdit().model_dump(mode="json")
+    assert reel_v6.edit_v5_to_v6(already) is already
+    old = v5((1, 2, False), captions=[])
+    assert reel_v6.edit_v6_to_v5(old) is old
+
+
+def test_downgrade_puts_overlays_back_in_source_time() -> None:
+    """Each text overlay becomes a caption per segment it covers (that segment's
+    source time; slow-mo halves); positions and sizes are lost."""
+    new = {
+        "version": 6,
+        "format": "16:9",
+        "segments": [
+            {"id": "a", "start": 9, "end": 14, "slow_mo": False, "rally_id": 1},
+            {"id": "b", "start": 14, "end": 18, "slow_mo": True, "rally_id": 1},
+        ],
+        "overlays": [
+            {**placed("x", "across", 4, 7), "x": 0.1, "size": 0.12},
+            placed("y", "first", 1, 2),
+        ],
+    }
+    old = reel_v6.edit_v6_to_v5(new)
+    assert old == {
+        "version": 5,
+        "format": "16:9",
+        "segments": new["segments"],
+        "captions": [
+            caption("across", 13, 14),  # reel 4-5
+            caption("across", 14, 15),  # reel 5-7, slow-mo
+            caption("first", 10, 11),
+        ],
+    }
+
+
+def test_round_trip_of_captions_inside_segments() -> None:
+    old = v5((10, 20, False), (40, 45, True),
+             captions=[caption("a", 12, 14), caption("b", 41, 43)])  # fmt: skip
+    assert reel_v6.edit_v6_to_v5(reel_v6.edit_v5_to_v6(old)) == old
+
+
+def test_export_snapshots_captions_become_overlays_and_back() -> None:
+    """Already on the output timeline: same times, default place. v2 is left
+    alone; the downgrade sorts them by time (v1's order)."""
+    v1_snapshot = {
+        "version": 1,
+        "format": "9:16",
+        "segments": [{"start": 1, "end": 9, "slow_mo": False, "rally_id": None}],
+        "captions": [caption("Smash", 1.234, 3), caption("Nice", 4, 5)],
+        "duration": 8.0,
+    }
+    v2_snapshot = reel_v6.snapshot_v1_to_v2(v1_snapshot)
+    assert v2_snapshot == {
+        "version": 2,
+        "format": "9:16",
+        "segments": v1_snapshot["segments"],
+        "overlays": [
+            {k: v for k, v in placed("", "Smash", 1.234, 3).items() if k != "id"},
+            {k: v for k, v in placed("", "Nice", 4, 5).items() if k != "id"},
+        ],
+        "duration": 8.0,
+    }
+    ExportSnapshot.model_validate(v2_snapshot)  # reads as today's snapshot
+    assert reel_v6.snapshot_v1_to_v2(v2_snapshot) is v2_snapshot
+    assert reel_v6.snapshot_v2_to_v1(v2_snapshot) == v1_snapshot
+    assert reel_v6.snapshot_v2_to_v1(v1_snapshot) is v1_snapshot
+    # Snapshots stored before versions existed in them read as v1
+    unversioned = {k: v for k, v in v1_snapshot.items() if k != "version"}
+    assert reel_v6.snapshot_v1_to_v2(unversioned) == v2_snapshot
+
+
+def test_downgrade_ignores_float_noise_at_segment_boundaries() -> None:
+    """0.7 + (10.6 - 10) is 1.2999999999999996, not 1.3: an overlay ending at 1.3
+    must not give the next segment a zero-length caption (found on the dev DB)."""
+    old = v5((0, 0.7, False), (10, 10.6, False), (20, 21, False), captions=[])
+    new = {**reel_v6.edit_v5_to_v6(old), "overlays": [placed("o", "x", 0.2, 1.3)]}
+    assert reel_v6.edit_v6_to_v5(new)["captions"] == [
+        caption("x", 0.2, 0.7),
+        caption("x", 10, 10.6),
+    ]
