@@ -27,8 +27,11 @@ dev = [
     "ty>=0.0.25",
     "ruff<1.0.0,>=0.16.0",
     "coverage<8.0.0,>=7.4.3",
-    # The worker's export tests render captions (worker/caption_image.py)
+    # The worker's export tests render text overlays (worker/caption_image.py):
+    # Pillow draws them, PyICU finds the line breaks (builds against the system's
+    # ICU: see README)
     "pillow>=11.0",
+    "pyicu>=2.17",
 ]
 
 [build-system]

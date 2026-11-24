@@ -4,7 +4,7 @@ import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, Union
 
 from pydantic import (
     AwareDatetime,
@@ -447,13 +447,11 @@ class TrajectoryPublic(SQLModel):
 
 # ---------------------------------------------------------------------------
 # Reels: non-destructive highlight edits. The original video is never changed; a
-# reel is an edit list (JSON) that the app plays back. All times are seconds in the
-# original video.
+# reel is an edit list (JSON) that the app plays back. Segment times are seconds in
+# the original video; overlay times are seconds of the reel itself.
 # ---------------------------------------------------------------------------
 
 REEL_TITLE_MAX_LENGTH = 100
-CAPTION_MAX_LENGTH = 80
-MAX_REEL_ITEMS = 500  # captions per reel
 # Segments per reel. Also the export's limit: ffmpeg opens the original once per
 # segment (frame-accurate seeks), so this bounds the worker's memory.
 MAX_REEL_SEGMENTS = 200
@@ -462,6 +460,13 @@ SEGMENT_PRECISION = 1  # decimals: start/end are stored to 0.1 s
 SEGMENT_ID_MAX_LENGTH = 64
 # The app's player may report a slightly different duration than ffprobe did
 TRIM_TOLERANCE = 0.1  # seconds
+# Overlays (text on top of the reel)
+MAX_OVERLAYS = 20
+MIN_OVERLAY_SECONDS = 0.3
+OVERLAY_TEXT_MAX_LENGTH = 80
+OVERLAY_ID_MAX_LENGTH = 64
+OVERLAY_SIZE_MIN, OVERLAY_SIZE_MAX, OVERLAY_SIZE_DEFAULT = 0.03, 0.15, 0.06
+SLOW_MO_FACTOR = 2.0  # slow-mo = half speed = twice as long in the reel
 
 
 class EditModel(BaseModel):
@@ -470,15 +475,8 @@ class EditModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class TimeRange(EditModel):
-    start: float = PydanticField(ge=0)
-    end: float = PydanticField(ge=0)
-
-    @model_validator(mode="after")
-    def check_order(self) -> Self:
-        if self.end <= self.start:
-            raise ValueError("end must be after start")
-        return self
+def _to_tenths(value: float) -> float:
+    return round(value, SEGMENT_PRECISION)
 
 
 class Segment(EditModel):
@@ -504,7 +502,7 @@ class Segment(EditModel):
     @field_validator("start", "end")
     @classmethod
     def to_precision(cls, value: float) -> float:
-        return round(value, SEGMENT_PRECISION)
+        return _to_tenths(value)
 
     @model_validator(mode="after")
     def check_length(self) -> Self:
@@ -515,63 +513,161 @@ class Segment(EditModel):
             )
         return self
 
+    @property
+    def reel_length(self) -> float:
+        """How long it plays in the reel (slow-mo twice its source length)."""
+        factor = SLOW_MO_FACTOR if self.slow_mo else 1.0
+        return (self.end - self.start) * factor
 
-class Caption(TimeRange):
-    text: str = PydanticField(min_length=1, max_length=CAPTION_MAX_LENGTH)
+
+class OverlayBase(EditModel):
+    """What every overlay type has: when (reel time) and where (fractions of the
+    output frame, so one position works for 16:9 and 9:16 and any quality)."""
+
+    id: str = PydanticField(
+        min_length=1,
+        max_length=OVERLAY_ID_MAX_LENGTH,
+        description="Chosen by the app, unique within the reel; kept as is",
+    )
+    start: float = PydanticField(
+        ge=0,
+        description="Seconds of REEL time (the reel's own timeline: segments one "
+        "after another, slow-mo counted double), stored to 0.1 s",
+    )
+    end: float = PydanticField(
+        ge=0,
+        description="Reel seconds, at least 0.3 s after start. Clamped to the reel's "
+        "length when saved",
+    )
+    x: float = PydanticField(
+        ge=0, le=1, description="Centre, as a fraction of the output frame's width"
+    )
+    y: float = PydanticField(
+        ge=0, le=1, description="Centre, as a fraction of the output frame's height"
+    )
+    size: float = PydanticField(
+        default=OVERLAY_SIZE_DEFAULT,
+        ge=OVERLAY_SIZE_MIN,
+        le=OVERLAY_SIZE_MAX,
+        description="Text height (font size, CSS font-size) as a fraction of the "
+        "output frame's height",
+    )
+
+    @field_validator("start", "end")
+    @classmethod
+    def to_precision(cls, value: float) -> float:
+        return _to_tenths(value)
+
+    @model_validator(mode="after")
+    def check_length(self) -> Self:
+        if self.end - self.start < MIN_OVERLAY_SECONDS - 1e-9:
+            raise ValueError(
+                f"an overlay must be at least {MIN_OVERLAY_SECONDS} s long (end after "
+                "start)"
+            )
+        return self
+
+
+class TextOverlay(OverlayBase):
+    """Text in a rounded box (the app's caption style), centred on (x, y)."""
+
+    type: Literal["text"]
+    text: str = PydanticField(min_length=1, max_length=OVERLAY_TEXT_MAX_LENGTH)
+
+
+# Overlay types, told apart by `type` (a tagged union already, so error locations
+# like ["overlays", 0, "text", "size"] and the OpenAPI schema stay the same when a
+# type is added). RESERVED, not accepted yet: "score", with the OverlayBase fields
+# (timing, position, size) and no stored content: its content will be computed from
+# the scored match at the source time of the segment playing underneath it. Adding
+# it: a ScoreOverlay(OverlayBase) with type Literal["score"], added to this Union.
+Overlay = Annotated[
+    Union[TextOverlay],  # noqa: UP007 (one member for now; `|` needs two)
+    PydanticField(discriminator="type"),
+]
 
 
 ReelFormat = Literal["16:9", "9:16"]
 
 
+def _unique_ids(items: Sequence[Segment | OverlayBase], what: str) -> None:
+    seen: set[str] = set()
+    for item in items:
+        if item.id in seen:
+            raise ValueError(f"{what} ids must be unique: {item.id!r} repeats")
+        seen.add(item.id)
+
+
 class ReelEdit(EditModel):
     """The edit list, stored as JSON. `version` changes when the format does; an
     Alembic migration converts stored reels, so the code only knows the current one.
-    v5 (this): a flat list of segments in playback order (Editor v2). v4 and before
-    described a reel as rally clips cut into pieces, with lead-in/out, deleted cuts
-    and restored breaks; migration 8f3a5c2d9e14 turned each into the segments it
-    played."""
+    v6 (this): overlays on the reel's own timeline. v5 had captions in source time
+    (migration 4c1e7a9b2d60 turned them into text overlays). v4 and before described
+    a reel as rally clips cut into pieces; migration 8f3a5c2d9e14 turned each into
+    the segments it played."""
 
-    version: Literal[5] = 5
+    version: Literal[6] = 6
     format: ReelFormat = "16:9"
     segments: list[Segment] = PydanticField(
         default=[],
         max_length=MAX_REEL_SEGMENTS,
         description="In playback order. May overlap in source time (a replay).",
     )
-    captions: list[Caption] = PydanticField(
+    overlays: list[Overlay] = PydanticField(
         default=[],
-        max_length=MAX_REEL_ITEMS,
-        description="Shown while the source time is inside [start, end), in every "
-        "segment that shows it (seconds in the original video)",
+        max_length=MAX_OVERLAYS,
+        description="Drawn in list order (later ones on top), each while the reel "
+        'time is inside [start, end). Types: "text". Reserved for later: "score" '
+        "(same timing, position and size fields; no stored content, it shows the "
+        "score of the scored match at the source time of the segment underneath).",
     )
 
     @field_validator("segments")
     @classmethod
-    def check_unique_ids(cls, segments: list[Segment]) -> list[Segment]:
-        seen: set[str] = set()
-        for segment in segments:
-            if segment.id in seen:
-                raise ValueError(f"segment ids must be unique: {segment.id!r} repeats")
-            seen.add(segment.id)
+    def check_unique_segment_ids(cls, segments: list[Segment]) -> list[Segment]:
+        _unique_ids(segments, "segment")
         return segments
+
+    @field_validator("overlays")
+    @classmethod
+    def check_unique_overlay_ids(cls, overlays: list[Overlay]) -> list[Overlay]:
+        _unique_ids(overlays, "overlay")
+        return overlays
+
+    @model_validator(mode="after")
+    def clamp_overlays(self) -> Self:
+        """Overlays are kept inside the reel: one running past its end is cut at
+        the end, one starting too late to show 0.3 s moves to the last 0.3 s. A reel
+        without segments has no length yet: its overlays are left as they are."""
+        length = self.length
+        if length <= 0:
+            return self
+        latest_start = _to_tenths(max(0.0, length - MIN_OVERLAY_SECONDS))
+        for overlay in self.overlays:
+            if overlay.end > length:
+                overlay.end = length
+                overlay.start = min(overlay.start, latest_start)
+        return self
+
+    @property
+    def length(self) -> float:
+        """The reel's length in seconds (to 0.1 s, like its segments)."""
+        return _to_tenths(sum(s.reel_length for s in self.segments))
 
     def problems(
         self, *, duration: float | None
     ) -> list[tuple[tuple[str | int, ...], str]]:
-        """Checks that need the video: (location in the edit, message) for each time
-        past its end (TRIM_TOLERANCE of slack)."""
+        """Checks that need the video: (location in the edit, message) for each
+        segment past its end (TRIM_TOLERANCE of slack)."""
         if duration is None:
             return []
         limit = duration + TRIM_TOLERANCE
         past_end = f"must be within the video (0-{duration:.2f} s)"
-        found: list[tuple[tuple[str | int, ...], str]] = []
-        for i, segment in enumerate(self.segments):
-            if segment.end > limit:
-                found.append((("segments", i, "end"), past_end))
-        for i, caption in enumerate(self.captions):
-            if caption.end > limit:
-                found.append((("captions", i, "end"), past_end))
-        return found
+        return [
+            (("segments", i, "end"), past_end)
+            for i, segment in enumerate(self.segments)
+            if segment.end > limit
+        ]
 
     def with_known_rallies(self, rally_ids: set[int]) -> ReelEdit:
         """rally_id is a label: one that isn't (any more) a rally of the video reads
@@ -705,19 +801,26 @@ class ExportSegment(BaseModel):
     rally_id: int | None = PydanticField(default=None, description="Label only")
 
 
-class ExportCaption(BaseModel):
+class ExportTextOverlay(BaseModel):
+    type: Literal["text"] = "text"
     text: str
     start: float = PydanticField(description="Seconds in the exported video")
     end: float
+    x: float = PydanticField(description="Centre, fraction of the output width")
+    y: float = PydanticField(description="Centre, fraction of the output height")
+    size: float = PydanticField(description="Font size, fraction of the height")
 
 
 class ExportSnapshot(BaseModel):
-    """Everything the worker needs to render, with absolute times (stored as JSON)."""
+    """Everything the worker needs to render, with absolute times (stored as JSON).
+    v2: overlays (v1 had bottom captions; migration 4c1e7a9b2d60 converted them)."""
 
-    version: Literal[1] = 1
+    version: Literal[2] = 2
     format: ReelFormat
     segments: list[ExportSegment]
-    captions: list[ExportCaption]
+    overlays: list[ExportTextOverlay] = PydanticField(
+        description="Drawn in list order, later ones on top"
+    )
     duration: float = PydanticField(description="Expected output length, seconds")
 
 

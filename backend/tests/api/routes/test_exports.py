@@ -93,7 +93,19 @@ def reel_edit(rallies: list[int]) -> dict[str, Any]:
             seg("break", 18, 29),  # footage between the rallies
             seg("b", 29, 46, rally_id=b),
         ],
-        "captions": [{"text": "สุดยอด!", "start": 12, "end": 16}],
+        # Reel time: over the end of a1 and the slow-mo a2 (reel 6-12)
+        "overlays": [
+            {
+                "id": "o1",
+                "type": "text",
+                "text": "สุดยอด!",
+                "start": 3,
+                "end": 8,
+                "x": 0.3,
+                "y": 0.2,
+                "size": 0.1,
+            }
+        ],
     }
 
 
@@ -171,7 +183,9 @@ def test_create_export(
     db.refresh(stored)
     a, b = video[1]
     assert [s["rally_id"] for s in stored.snapshot["segments"]] == [a, a, None, b]
-    assert stored.snapshot["captions"] == [{"text": "สุดยอด!", "start": 3.0, "end": 8.0}]
+    assert stored.snapshot["version"] == 2
+    assert stored.snapshot["overlays"] == [{"type": "text", "text": "สุดยอด!",
+        "start": 3.0, "end": 8.0, "x": 0.3, "y": 0.2, "size": 0.1}]  # fmt: skip
 
 
 def test_format_override_and_1080p(

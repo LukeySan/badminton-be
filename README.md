@@ -38,7 +38,7 @@ backend/             FastAPI API (the template's "app" package)
 worker/              processing: 512x288 analysis copy → TrackNet shuttle tracking → rally detection
   run_worker.py        the job loop: claims queued exports, then videos
   reel_export.py       renders a reel export with ffmpeg (from the original upload)
-  caption_image.py     caption images (Pillow), styled like the app; fonts/ (OFL)
+  caption_image.py     text overlay images (Pillow), styled like the app; fonts/ (OFL)
   pipeline.py          one video in, rallies out (also a CLI)
   detector.py          detect_rallies(): v1 (rules) or v1.1 (rules + classifier + model boundaries)
   rally_features.py    v1.1's feature code (copied from research; inference only)
@@ -63,11 +63,22 @@ You need [Homebrew](https://brew.sh), [Docker Desktop](https://www.docker.com/pr
 and [uv](https://docs.astral.sh/uv/) (`brew install uv`). uv installs Python 3.14 itself.
 
 ```bash
-brew install ffmpeg fribidi   # fribidi: Thai captions in exported reels (see The worker)
+brew install ffmpeg fribidi icu4c pkgconf  # fribidi, icu4c: Thai text in exported reels
 cd badminton-backend
 cp .env.example .env          # development defaults; edit if you like
-uv sync --all-packages        # API + worker dependencies into .venv/
+# PyICU (line breaks in text overlays) has no wheels: uv builds it against ICU.
+# Point it at Homebrew's ICU, and keep conda off PATH for this command (conda's own
+# icu-config wins otherwise, linking an ICU that only exists inside conda):
+PATH=$(echo "$PATH" | tr ':' '\n' | grep -v -i conda | paste -sd: -) \
+  PKG_CONFIG_PATH="$(brew --prefix icu4c)/lib/pkgconfig" \
+  uv sync --all-packages      # API + worker dependencies into .venv/
 ```
+
+Check: `uv run --package worker python -c "import icu; print(icu.ICU_VERSION)"`
+prints Homebrew's ICU version (79.1 when this was written). After `brew upgrade
+icu4c` changes the major version, rebuild it the same way with `uv pip install
+--python .venv --no-cache --reinstall pyicu==2.17` (uv's cache keeps the old build).
+Linux: `apt install libicu-dev pkg-config` before `uv sync`.
 
 **Model weights** (only needed for processing). Download `TrackNet_best.pt` from the
 [TrackNetV3 README](https://github.com/qaz812345/TrackNetV3) into `worker/ckpts/`, or copy
@@ -91,7 +102,7 @@ uv run bash scripts/prestart.sh
 uv run fastapi dev
 
 # 4. In a second terminal, from the repo root: the worker that processes videos
-#    and renders exports (the export line is for Thai captions, see The worker)
+#    and renders exports (the export line is for Thai text, see The worker)
 export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib:/usr/lib
 uv run --package worker python worker/run_worker.py
 ```
@@ -159,20 +170,24 @@ something other than showing the message also carry a `code`
 (`{"detail": "...", "code": "trajectory_missing"}`); match on the code, never the text.
 
 **Reels** are non-destructive highlight edits: the original video is never changed; a
-reel is an edit list the app plays back. All times are seconds in the original video.
+reel is an edit list the app plays back. Segment times are seconds in the original
+video; overlay times are seconds of the reel itself.
 For the beta a video has one reel (enforced by the database: a unique index on
 `video_id` over reels that aren't deleted).
 
 ```jsonc
 {
-  "version": 5,
+  "version": 6,
   "format": "16:9",           // or "9:16"
   "segments": [               // in playback order: the reel is these, one after another
     {"id": "c3", "start": 71.0, "end": 94.0, "slow_mo": false, "rally_id": 271},
     {"id": "c3b", "start": 80.5, "end": 84.0, "slow_mo": true, "rally_id": 271},  // a replay
     {"id": "x1", "start": 744.0, "end": 752.0, "slow_mo": false, "rally_id": null} // footage
   ],                                                                               // outside rallies
-  "captions": [{"text": "What a smash", "start": 82, "end": 84}]  // source seconds
+  "overlays": [               // drawn in list order (later on top)
+    {"id": "o1", "type": "text", "text": "What a smash", "start": 12.0, "end": 15.0,
+     "x": 0.5, "y": 0.85, "size": 0.06}   // reel seconds; centre and text height as
+  ]                                       // fractions of the output frame
 }
 ```
 
@@ -181,17 +196,31 @@ in list order. Segment times are seconds in the original video, stored to 0.1 s,
 least 0.3 s long, inside the video (0.1 s tolerance). Segments may overlap in source
 time (a replay), at most 200 per reel. `id` is the app's (unique within the reel).
 `rally_id` is a label only: null for footage from outside the rallies, and a rally
-that no longer exists reads as null (its footage keeps playing). A caption shows while
-the source time is inside it, in every segment that shows that time.
-Rejected with 422 (with the usual `loc`, e.g. `["body","edit","segments",2,"end"]`):
-segments shorter than 0.3 s, backwards, past the end of the video, repeated ids,
-captions over 80 characters, unknown fields, `version` other than 5.
+that no longer exists reads as null (its footage keeps playing).
+
+Overlays (at most 20) are on the reel's own timeline: `start`/`end` are seconds of
+the reel (segments back to back, slow-mo counted double), stored to 0.1 s, at least
+0.3 s long. `x`, `y` are the centre as fractions (0-1) of the output frame, so the
+same overlay works in 16:9 and 9:16 and at any quality; `size` is the text height
+(font size) as a fraction of the output frame's height (0.03-0.15, default 0.06).
+Saving clamps overlays to the reel's length: one running past the end is cut there,
+one starting too late keeps the last 0.3 s (a reel without segments keeps them as
+they are). Types: `"text"` (`text`, up to 80 characters). `"score"` is reserved for
+later (same timing, position and size; no stored content, it will show the scored
+match's score at the source time underneath) and is rejected for now.
+Rejected with 422 (with the usual `loc`, e.g. `["body","edit","segments",2,"end"]`,
+`["body","edit","overlays",0,"text","size"]`): segments shorter than 0.3 s,
+backwards, past the end of the video, repeated ids; overlays shorter than 0.3 s,
+outside 0-1, size out of range, more than 20, text over 80 characters, unknown
+types; unknown fields; `version` other than 6.
 
 Older versions were converted by migrations: v1 (one `trim_start`/`trim_end` per clip)
 → v2 pieces with lead-in/out; v2 → v3 restored breaks as anchors; v3 → v4 deleted
 footage as cuts; v4 → v5 each reel became exactly the segments its "Rallies only"
 playback played (pieces with their lead, and restored breaks as unlabelled segments),
-in the same order, times rounded to 0.1 s.
+in the same order, times rounded to 0.1 s; v5 → v6 captions (source time) became text
+overlays on the reel's timeline where the export showed them (x 0.5, y 0.85, size
+0.06), and export snapshots' captions became overlays too.
 
 **Rally corrections** (add, edit, delete, split, merge) each return what changed:
 
@@ -302,7 +331,7 @@ uv run --package worker python worker/run_worker.py --once           # wait for 
 uv run --package worker python worker/run_worker.py --batch-size 16  # on an NVIDIA GPU
 ```
 
-**Why the `DYLD_...` line (macOS):** export captions are drawn with Pillow, and Thai
+**Why the `DYLD_...` line (macOS):** export text overlays are drawn with Pillow, and Thai
 needs its complex text layout (raqm), which loads FriBiDi at runtime. Pillow looks for
 it only on the default library path, which doesn't include Homebrew's
 `/opt/homebrew/lib`. The worker refuses to start without it, with this hint.
@@ -364,16 +393,21 @@ uv run --package worker python worker/backfill_thumbnails.py --video <id> --forc
 (`worker/reel_export.py`) from the **original upload**, not the 512x288 analysis copy:
 
 - What plays is the reel's segments in order, slow-mo ones at half speed (video
-  `setpts` x2, audio `atempo` 0.5). Exports made before edit list v5 keep the
-  snapshot they were made with.
+  `setpts` x2, audio `atempo` 0.5). Exports keep the snapshot they were made with
+  (migrations only convert its format).
 - Each piece is cut frame-accurately (input seeking + re-encode, no stream copy) and
   joined with the concat filter. 16:9 is scaled to 1280x720 / 1920x1080 (letterboxed
   if the original isn't 16:9); 9:16 is centre-cropped, then scaled to 720x1280 /
   1080x1920. 1080p only for an original that is at least 1080p.
-- Captions are images drawn with Pillow (Manrope ExtraBold, Noto Sans Thai for Thai;
-  bundled in `worker/fonts/` with their OFL licenses), overlaid while they're on:
-  light text on a dark rounded box near the bottom, higher up in 9:16 for the social
-  apps' buttons. Emoji aren't drawn (no bundled font has them).
+- Text overlays are images drawn with Pillow (Manrope ExtraBold, Noto Sans Thai for
+  Thai; bundled in `worker/fonts/` with their OFL licenses) at their size for the
+  export's resolution, overlaid while they're on, in list order: light text on a dark
+  rounded box, centred on (x, y) and kept inside a small safe margin (3% of the
+  shorter side). Emoji aren't drawn (no bundled font has them).
+- Long text wraps where the browser would wrap it: ICU's line breaking (PyICU), which
+  breaks Thai, written without spaces, between dictionary words. A fixture shared
+  with the frontend (`backend/tests/fixtures/line_breaks/`, made with the browser's
+  `Intl.Segmenter`) keeps the two in step.
 - H.264 CRF 20, yuv420p, `+faststart`; AAC audio (a silent track if the original has
   none). No `-r`: frames keep their timestamps, so variable-frame-rate phone video
   keeps its timing.

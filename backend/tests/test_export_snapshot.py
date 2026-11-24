@@ -1,11 +1,12 @@
-"""app/export_snapshot.py: what an export plays, from an edit list v5 (the segments
-in order). How v4 reels became segments is tested in test_migrations.py."""
+"""app/export_snapshot.py: what an export plays, from an edit list v6 (the segments
+in order, overlays on the reel's timeline). How older reels were converted is tested
+in test_migrations.py."""
 
 from typing import Any
 
 import pytest
 
-from app.export_snapshot import build_snapshot, subtract
+from app.export_snapshot import build_snapshot, to_output_time
 from app.models import ExportSnapshot, ReelEdit
 
 
@@ -62,34 +63,64 @@ def test_no_segments_no_snapshot_segments() -> None:
     assert snapshot.segments == [] and snapshot.duration == 0
 
 
-def test_captions_on_the_output_timeline() -> None:
-    """Shown while the source time is inside them, in every segment that shows it
-    (a replay shows it again), doubled in slow-mo, joined across touching segments;
-    where two overlap the first in the list wins."""
+def text(id: str, start: float, end: float, **kw: Any) -> dict[str, Any]:
+    return {"id": id, "type": "text", "text": kw.pop("text", id), "start": start,
+            "end": end, "x": kw.pop("x", 0.5), "y": kw.pop("y", 0.85), **kw}  # fmt: skip
+
+
+def test_overlays_keep_reel_time_list_order_and_place() -> None:
+    """Overlays are already on the reel's timeline (slow-mo counted double); the
+    export keeps their order (drawing order: later on top) and position."""
     edit = edit_of(
-        seg(9, 14, id="a"),
-        seg(14, 18, slow_mo=True, id="b"),
-        seg(29, 41, id="c"),
-        seg(12, 14, id="replay"),
-        captions=[
-            {"text": "Huge smash", "start": 12, "end": 16},
-            {"text": "First", "start": 30, "end": 32},
-            {"text": "Second", "start": 31, "end": 33},
-            {"text": "Never shown", "start": 45, "end": 47},
+        seg(9, 14, id="a"),  # reel 0-5
+        seg(14, 18, slow_mo=True, id="b"),  # reel 5-13
+        seg(29, 41, id="c"),  # reel 13-25
+        overlays=[
+            text("late", 20, 24, x=0.2, y=0.1, size=0.15),
+            text("early", 3, 9),
+            text("on-top", 3, 4),
         ],
     )
     snapshot = build_snapshot(edit, duration=60)
-    assert snapshot.model_dump()["captions"] == [
-        {"text": "Huge smash", "start": 3, "end": 9},  # 12-14 normal, 14-16 slow
-        {"text": "First", "start": 14, "end": 16},
-        {"text": "Second", "start": 16, "end": 17},
-        {"text": "Huge smash", "start": 25, "end": 27},  # the replay
+    assert snapshot.model_dump()["overlays"] == [
+        {"type": "text", "text": "late", "start": 20, "end": 24, "x": 0.2, "y": 0.1,
+         "size": 0.15},
+        {"type": "text", "text": "early", "start": 3, "end": 9, "x": 0.5, "y": 0.85,
+         "size": 0.06},
+        {"type": "text", "text": "on-top", "start": 3, "end": 4, "x": 0.5,
+         "y": 0.85, "size": 0.06},
+    ]  # fmt: skip
+
+
+def test_overlays_follow_a_segment_cut_at_the_videos_end() -> None:
+    """A segment ending past the video (within the 0.1 s tolerance) is cut in the
+    export: overlays after it move up by the cut, one inside the cut-off part ends
+    with the segment, and one only inside the cut-off part isn't drawn."""
+    edit = edit_of(
+        seg(25, 30.1, id="end"),  # reel 0-5.1, output 0-5.04
+        seg(10, 12, id="next"),  # reel 5.1-7.1, output 5.04-7.04
+        overlays=[
+            text("after", 5.5, 6.5),
+            text("across", 4.5, 5.6),
+            text("cut-off", 4.8, 5.1),
+        ],
+    )
+    edit.overlays[2].start = 5.06  # under 0.3 s: not valid in an edit, set by hand
+    snapshot = build_snapshot(edit, duration=30.04)
+    assert [(o.text, o.start, o.end) for o in snapshot.overlays] == [
+        ("after", 5.44, 6.44),
+        ("across", 4.5, 5.54),
     ]
+    assert snapshot.duration == 7.04
 
 
-def test_caption_shorter_than_a_frame_is_left_out() -> None:
-    edit = edit_of(seg(1, 5), captions=[{"text": "x", "start": 4.995, "end": 6}])
-    assert build_snapshot(edit, duration=10).captions == []
+def test_overlay_past_the_output_is_cut_to_it() -> None:
+    """The edit keeps overlays inside the reel; the output can still end a little
+    earlier (cut segment)."""
+    edit = edit_of(seg(25, 30.1), overlays=[text("o", 4, 5.1)])
+    assert [
+        (o.start, o.end) for o in build_snapshot(edit, duration=30.04).overlays
+    ] == [(4, 5.04)]
 
 
 def test_snapshot_round_trips_as_stored_json() -> None:
@@ -100,8 +131,9 @@ def test_snapshot_round_trips_as_stored_json() -> None:
 
 
 def test_snapshots_stored_before_v5_still_read() -> None:
-    """Exports made from v4 reels stored a `kind` per segment; it's ignored."""
-    old = {"version": 1, "format": "16:9", "duration": 12.0, "captions": [],
+    """Exports made from v4 reels stored a `kind` per segment; it's ignored. (Their
+    captions became overlays in migration 4c1e7a9b2d60: snapshot v2.)"""
+    old = {"version": 2, "format": "16:9", "duration": 12.0, "overlays": [],
            "segments": [{"kind": "gap", "start": 21, "end": 29, "slow_mo": False},
                         {"kind": "piece", "start": 29, "end": 33, "slow_mo": False}]}  # fmt: skip
     snapshot = ExportSnapshot.model_validate(old)
@@ -111,19 +143,13 @@ def test_snapshots_stored_before_v5_still_read() -> None:
     ]
 
 
-@pytest.mark.parametrize(
-    ("span", "holes", "parts"),
-    [
-        ((0, 10), [], [(0, 10)]),
-        ((0, 10), [(2, 3)], [(0, 2), (3, 10)]),
-        ((0, 10), [(-5, 2), (8, 20)], [(2, 8)]),
-        ((0, 10), [(0, 10)], []),
-        ((0, 10), [(10, 12)], [(0, 10)]),  # touching isn't overlapping
-    ],
-)
-def test_subtract(
-    span: tuple[float, float],
-    holes: list[tuple[float, float]],
-    parts: list[tuple[float, float]],
-) -> None:
-    assert subtract(span, holes) == parts
+def test_reel_time_to_output_time() -> None:
+    """Segments of the reel: (reel start, reel length, output length)."""
+    timeline = [(0.0, 5.1, 5.04), (5.1, 2.0, 2.0), (7.1, 1.0, 0.0)]
+    assert to_output_time(0, timeline) == 0
+    assert to_output_time(5.0, timeline) == 5.0
+    assert to_output_time(5.08, timeline) == 5.04  # in the cut-off part: its end
+    assert to_output_time(5.1, timeline) == 5.04
+    assert to_output_time(6.1, timeline) == pytest.approx(6.04)
+    assert to_output_time(7.5, timeline) == 7.04  # a segment wholly past the video
+    assert to_output_time(99, timeline) == 7.04

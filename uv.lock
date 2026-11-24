@@ -96,6 +96,7 @@ dev = [
     { name = "coverage" },
     { name = "mypy" },
     { name = "pillow" },
+    { name = "pyicu" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "ty" },
@@ -124,6 +125,7 @@ dev = [
     { name = "coverage", specifier = ">=7.4.3,<8.0.0" },
     { name = "mypy", specifier = ">=1.8.0,<3.0.0" },
     { name = "pillow", specifier = ">=11.0" },
+    { name = "pyicu", specifier = ">=2.17" },
     { name = "pytest", specifier = ">=7.4.3,<10.0.0" },
     { name = "ruff", specifier = ">=0.16.0,<1.0.0" },
     { name = "ty", specifier = ">=0.0.25" },
@@ -1996,6 +1998,12 @@ wheels = [
 ]
 
 [[package]]
+name = "pyicu"
+version = "2.17"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/b0/4e/e9537414644692b556b870716b47e43c54d9b8d314a2a004abca6f7492dd/pyicu-2.17.tar.gz", hash = "sha256:6138b95ac9592fa3983bf489e0c625e8fcfffd0c562a36a08269cecc4ffb48be", size = 270436, upload-time = "2026-10-23T12:25:55.596Z" }
+
+[[package]]
 name = "pyjwt"
 version = "2.15.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2785,6 +2793,7 @@ dependencies = [
     { name = "pandas" },
     { name = "parse" },
     { name = "pillow" },
+    { name = "pyicu" },
     { name = "scikit-learn" },
     { name = "torch" },
     { name = "tqdm" },
@@ -2797,6 +2806,7 @@ requires-dist = [
     { name = "pandas", specifier = ">=2.2" },
     { name = "parse", specifier = ">=1.20" },
     { name = "pillow", specifier = ">=11.0" },
+    { name = "pyicu", specifier = ">=2.17" },
     { name = "scikit-learn", specifier = "==1.9.1" },
     { name = "torch", specifier = ">=2.9" },
     { name = "tqdm", specifier = ">=4.66" },

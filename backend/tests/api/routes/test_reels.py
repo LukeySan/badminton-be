@@ -10,8 +10,12 @@ from sqlmodel import Session, col, select
 from app import crud
 from app.core.config import settings
 from app.models import (
-    CAPTION_MAX_LENGTH,
+    MAX_OVERLAYS,
     MAX_REEL_SEGMENTS,
+    OVERLAY_ID_MAX_LENGTH,
+    OVERLAY_SIZE_MAX,
+    OVERLAY_SIZE_MIN,
+    OVERLAY_TEXT_MAX_LENGTH,
     SEGMENT_ID_MAX_LENGTH,
     Rally,
     Reel,
@@ -70,10 +74,10 @@ def other_user_headers(client: TestClient, db: Session) -> dict[str, str]:
 def full_edit(rally_ids: list[int]) -> dict[str, Any]:
     """Rallies are 10-20 s and 30-45 s. Segments in playback order: rally 2, then
     rally 1 in two parts (the second slow), a replay of part of rally 2, and footage
-    from outside the rallies."""
+    from outside the rallies (45.5 s of reel); a text overlay over the replay."""
     a, b = rally_ids
     return {
-        "version": 5,
+        "version": 6,
         "format": "9:16",
         "segments": [
             seg("b", 29.0, 46.0, rally_id=b),
@@ -82,7 +86,7 @@ def full_edit(rally_ids: list[int]) -> dict[str, Any]:
             seg("b-replay", 40.0, 43.0, slow_mo=True, rally_id=b),
             seg("crowd", 50.0, 54.5),
         ],
-        "captions": [{"text": "What a smash", "start": 40.0, "end": 43.0}],
+        "overlays": [overlay("smash", 35.0, 41.0, text="What a smash", y=0.2)],
     }
 
 
@@ -95,6 +99,13 @@ def seg(
 ) -> dict[str, Any]:
     return {"id": id, "start": start, "end": end, "slow_mo": slow_mo,
             "rally_id": rally_id}  # fmt: skip
+
+
+def overlay(id: str, start: float, end: float, **kw: Any) -> dict[str, Any]:
+    """A text overlay as stored (all fields, defaults filled in)."""
+    return {"id": id, "type": "text", "text": kw.pop("text", "Nice"), "start": start,
+            "end": end, "x": kw.pop("x", 0.5), "y": kw.pop("y", 0.85),
+            "size": kw.pop("size", 0.06), **kw}  # fmt: skip
 
 
 CreateFn = Callable[..., dict[str, Any]]
@@ -149,17 +160,80 @@ def test_create_and_read_reel(
 def test_new_reel_gets_an_empty_edit_with_defaults(create: CreateFn) -> None:
     reel = create()
     assert reel["edit"] == {
-        "version": 5,
+        "version": 6,
         "format": "16:9",
         "segments": [],
-        "captions": [],
+        "overlays": [],
     }
 
 
 def test_times_are_stored_to_tenths(create: CreateFn) -> None:
     """0.1 s precision: the app may send JavaScript's 12.300000000000001."""
-    reel = create(edit={"segments": [seg("a", 12.300000000000001, 14.04)]})
+    reel = create(edit={"segments": [seg("a", 12.300000000000001, 14.04)],
+                        "overlays": [overlay("o", 0.3000000000000001, 1.04)]})  # fmt: skip
     assert reel["edit"]["segments"] == [seg("a", 12.3, 14.0)]
+    assert reel["edit"]["overlays"] == [overlay("o", 0.3, 1.0)]
+
+
+def test_overlays_are_clamped_to_the_reel_on_save(
+    client: TestClient,
+    video: tuple[uuid.UUID, list[int]],
+    normal_user_token_headers: dict[str, str],
+    create: CreateFn,
+) -> None:
+    """Overlays are in reel time, so they end with the reel: one running past the
+    end is cut there, one starting too late keeps the last 0.3 s. When a later save
+    shrinks the reel, its overlays are clamped again. A reel without segments has no
+    length yet: its overlays are kept as they are."""
+    h = normal_user_token_headers
+    url = f"{API}/videos/{video[0]}/reel"
+
+    def spans(edit: dict[str, Any]) -> list[tuple[str, float, float]]:
+        return [(o["id"], o["start"], o["end"]) for o in edit["overlays"]]
+
+    # 5 s + 2.5 s of slow-mo (5 s) = a 10 s reel
+    reel = create(edit={
+        "segments": [seg("a", 10, 15), seg("b", 30, 32.5, slow_mo=True)],
+        "overlays": [overlay("inside", 1, 4), overlay("across", 8, 12),
+                     overlay("past", 11, 14), overlay("last", 9.7, 10)],
+    })  # fmt: skip
+    assert spans(reel["edit"]) == [
+        ("inside", 1, 4),
+        ("across", 8, 10),
+        ("past", 9.7, 10),
+        ("last", 9.7, 10),
+    ]
+    assert client.get(url, headers=h).json()["edit"] == reel["edit"]  # as stored
+
+    # The reel shrinks to 3 s
+    edit = {**reel["edit"], "segments": [seg("a", 10, 13)]}
+    r = client.put(url, headers=h, json={"title": "x", "edit": edit,
+                                         "updated_at": reel["updated_at"]})  # fmt: skip
+    assert r.status_code == 200, r.text
+    reel = r.json()
+    assert spans(reel["edit"]) == [
+        ("inside", 1, 3),
+        ("across", 2.7, 3),
+        ("past", 2.7, 3),
+        ("last", 2.7, 3),
+    ]
+    # Everything else about them is kept
+    assert reel["edit"]["overlays"][0] == overlay("inside", 1, 3)
+
+    # No segments: nothing to clamp to
+    edit = {**reel["edit"], "segments": []}
+    r = client.put(url, headers=h, json={"title": "x", "edit": edit,
+                                         "updated_at": reel["updated_at"]})  # fmt: skip
+    assert r.status_code == 200, r.text
+    assert r.json()["edit"]["overlays"] == reel["edit"]["overlays"]
+
+
+def test_reel_length_counts_slow_mo_double() -> None:
+    edit = ReelEdit.model_validate(
+        {"segments": [seg("a", 1, 2.3), seg("b", 5, 5.7, slow_mo=True), seg("c", 1, 2)]}
+    )
+    assert edit.length == 1.3 + 1.4 + 1.0
+    assert ReelEdit().length == 0
 
 
 def test_labels_of_other_videos_rallies_are_stored_as_null(
@@ -238,7 +312,7 @@ def test_update_replaces_title_and_whole_edit(
     assert saved["title"] == "Renamed"
     # Full replace: what wasn't sent is back to the defaults, not merged
     assert saved["edit"]["format"] == "16:9"
-    assert saved["edit"]["captions"] == []
+    assert saved["edit"]["overlays"] == []
     assert saved["edit"]["segments"] == [seg("only", 10, 19, rally_id=video[1][0])]
     assert when(saved["updated_at"]) > when(reel["updated_at"])
     assert saved["created_at"] == reel["created_at"]
@@ -421,7 +495,6 @@ def many(n: int, length: float = 0.5) -> list[dict[str, Any]]:
     [
         # Checked against the video
         pytest.param({"segments": [seg("a", 110, DURATION + 0.2)]}, ["segments", 0, "end"], id="segment-past-end"),
-        pytest.param({"captions": [{"text": "x", "start": 110, "end": DURATION + 1}]}, ["captions", 0, "end"], id="caption-past-end"),
         # Pydantic
         pytest.param({"segments": [seg("a", 12, 12.2)]}, ["segments", 0], id="shorter-than-0.3"),
         pytest.param({"segments": [seg("a", 12, 12.24)]}, ["segments", 0], id="0.24-rounds-to-0.2"),
@@ -433,10 +506,31 @@ def many(n: int, length: float = 0.5) -> list[dict[str, Any]]:
         pytest.param({"segments": [{"start": 1, "end": 2}]}, ["segments", 0, "id"], id="id-required"),
         pytest.param({"segments": many(MAX_REEL_SEGMENTS + 1)}, ["segments"], id="over-200-segments"),
         pytest.param({"segments": [{**seg("a", 1, 2), "speed": 0.5}]}, ["segments", 0, "speed"], id="unknown-segment-field"),
-        pytest.param({"captions": [{"text": "x" * (CAPTION_MAX_LENGTH + 1), "start": 1, "end": 2}]}, ["captions", 0, "text"], id="caption-81-chars"),
-        pytest.param({"captions": [{"text": "", "start": 1, "end": 2}]}, ["captions", 0, "text"], id="caption-empty"),
-        pytest.param({"captions": [{"text": "x", "start": 3, "end": 2}]}, ["captions", 0], id="caption-backwards"),
+        # Overlays
+        pytest.param({"overlays": [overlay("o", 1, 2, text="x" * (OVERLAY_TEXT_MAX_LENGTH + 1))]}, ["overlays", 0, "text", "text"], id="text-81-chars"),
+        pytest.param({"overlays": [overlay("o", 1, 2, text="")]}, ["overlays", 0, "text", "text"], id="text-empty"),
+        pytest.param({"overlays": [overlay("o", 3, 2)]}, ["overlays", 0, "text"], id="overlay-backwards"),
+        pytest.param({"overlays": [overlay("o", 1, 1.2)]}, ["overlays", 0, "text"], id="overlay-shorter-than-0.3"),
+        pytest.param({"overlays": [overlay("o", 1, 1.24)]}, ["overlays", 0, "text"], id="overlay-0.24-rounds-to-0.2"),
+        pytest.param({"overlays": [overlay("o", -1, 2)]}, ["overlays", 0, "text", "start"], id="overlay-negative-start"),
+        pytest.param({"overlays": [overlay("o", 1, 2, size=OVERLAY_SIZE_MIN - 0.001)]}, ["overlays", 0, "text", "size"], id="size-too-small"),
+        pytest.param({"overlays": [overlay("o", 1, 2, size=OVERLAY_SIZE_MAX + 0.001)]}, ["overlays", 0, "text", "size"], id="size-too-big"),
+        pytest.param({"overlays": [overlay("o", 1, 2, x=-0.01)]}, ["overlays", 0, "text", "x"], id="x-below-0"),
+        pytest.param({"overlays": [overlay("o", 1, 2, x=1.01)]}, ["overlays", 0, "text", "x"], id="x-above-1"),
+        pytest.param({"overlays": [overlay("o", 1, 2, y=-0.01)]}, ["overlays", 0, "text", "y"], id="y-below-0"),
+        pytest.param({"overlays": [overlay("o", 1, 2, y=1.01)]}, ["overlays", 0, "text", "y"], id="y-above-1"),
+        pytest.param({"overlays": [{k: v for k, v in overlay("o", 1, 2).items() if k != "x"}]}, ["overlays", 0, "text", "x"], id="x-required"),
+        pytest.param({"overlays": [overlay("o", 1, 2), overlay("o", 3, 4)]}, ["overlays"], id="repeated-overlay-id"),
+        pytest.param({"overlays": [overlay("", 1, 2)]}, ["overlays", 0, "text", "id"], id="empty-overlay-id"),
+        pytest.param({"overlays": [overlay("x" * (OVERLAY_ID_MAX_LENGTH + 1), 1, 2)]}, ["overlays", 0, "text", "id"], id="overlay-id-too-long"),
+        pytest.param({"overlays": [overlay(f"o{i}", 1, 2) for i in range(MAX_OVERLAYS + 1)]}, ["overlays"], id="over-20-overlays"),
+        pytest.param({"overlays": [{**overlay("o", 1, 2), "color": "red"}]}, ["overlays", 0, "text", "color"], id="unknown-overlay-field"),
+        # "score" is reserved for later, not accepted yet
+        pytest.param({"overlays": [{**overlay("o", 1, 2), "type": "score"}]}, ["overlays", 0], id="score-not-yet"),
+        pytest.param({"overlays": [{k: v for k, v in overlay("o", 1, 2).items() if k != "type"}]}, ["overlays", 0], id="type-required"),
+        pytest.param({"captions": [{"text": "x", "start": 1, "end": 2}]}, ["captions"], id="v5-captions"),
         pytest.param({"format": "1:1"}, ["format"], id="bad-format"),
+        pytest.param({"version": 5}, ["version"], id="v5"),
         pytest.param({"version": 4}, ["version"], id="v4"),
         pytest.param({"version": 1}, ["version"], id="old-version"),
         pytest.param({"clips": []}, ["clips"], id="v4-clips"),
@@ -476,7 +570,6 @@ def test_all_problems_are_reported_at_once(
 ) -> None:
     edit = {
         "segments": [seg("a", 10, 12), seg("b", 115, 121), seg("c", 100, 125)],
-        "captions": [{"text": "x", "start": 1, "end": 500}],
     }
     r = client.put(
         f"{API}/videos/{video[0]}/reel",
@@ -487,7 +580,6 @@ def test_all_problems_are_reported_at_once(
     assert [e["loc"] for e in r.json()["detail"]] == [
         ["body", "edit", "segments", 1, "end"],
         ["body", "edit", "segments", 2, "end"],
-        ["body", "edit", "captions", 0, "end"],
     ]
     assert r.json()["detail"][0]["msg"] == "must be within the video (0-120.00 s)"
 
@@ -496,8 +588,10 @@ def test_limits_that_are_allowed(
     create: CreateFn, video: tuple[uuid.UUID, list[int]]
 ) -> None:
     """Edges: 200 segments, 0.3 s ones, overlapping ones (replays) in any order, the
-    video's end (with the 0.1 s player tolerance), a 64-character id, an
-    80-character caption, footage outside the rallies (rally_id null)."""
+    video's end (with the 0.1 s player tolerance), a 64-character id, footage
+    outside the rallies (rally_id null); 20 overlays, 80 characters of text, the
+    smallest and largest size, positions on the frame's edges, overlapping ones,
+    0.3 s ones."""
     a, _ = video[1]
     edit = {
         "segments": [
@@ -507,10 +601,18 @@ def test_limits_that_are_allowed(
             seg("replay", 12, 14, slow_mo=True, rally_id=a),
             *many(MAX_REEL_SEGMENTS - 4, length=0.3),
         ],
-        "captions": [{"text": "x" * CAPTION_MAX_LENGTH, "start": 0, "end": DURATION}],
+        "overlays": [
+            overlay(
+                "x" * OVERLAY_ID_MAX_LENGTH, 0, 10, text="x" * OVERLAY_TEXT_MAX_LENGTH
+            ),
+            overlay("small", 0, 0.3, size=OVERLAY_SIZE_MIN, x=0, y=0),
+            overlay("big", 0, 10, size=OVERLAY_SIZE_MAX, x=1, y=1),
+            *[overlay(f"o{i}", 1, 2) for i in range(MAX_OVERLAYS - 3)],
+        ],
     }
     reel = create(edit=edit)
     assert len(reel["edit"]["segments"]) == MAX_REEL_SEGMENTS
+    assert reel["edit"]["overlays"] == edit["overlays"]
     assert reel["edit"]["segments"][1]["end"] == DURATION  # stored to 0.1 s
 
 
@@ -561,5 +663,5 @@ def test_reel_rows_store_plain_json(
     """The edit list is a JSONB document with the version inside."""
     create(edit=full_edit(video[1]))
     row = db.exec(select(Reel).where(col(Reel.video_id) == video[0])).one()
-    assert row.edit["version"] == 5
+    assert row.edit["version"] == 6
     assert row.edit["segments"][2]["slow_mo"] is True

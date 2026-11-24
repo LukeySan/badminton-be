@@ -36,23 +36,26 @@ jobs:
           # Reuse downloaded packages between runs; a new cache when uv.lock changes
           enable-cache: true
           cache-dependency-glob: uv.lock
+      # The video endpoints use ffprobe/ffmpeg, and the tests make sample videos
+      # with it. A stalled package mirror once hung this step for 10 minutes:
+      # apt now gives up on a stuck download after 30 s and retries.
+      # libfribidi0: Pillow's complex text layout (Thai text in reel exports).
+      # libicu-dev + pkg-config: PyICU (line breaks in text overlays) has no
+      # wheels and is built against them by `uv sync`, so this step comes first.
+      - name: Install ffmpeg and ICU
+        timeout-minutes: 5
+        run: |
+          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+          sudo apt-get $APT_OPTS update
+          sudo apt-get $APT_OPTS install -y --no-install-recommends ffmpeg libfribidi0 libicu-dev pkg-config
+          ffprobe -version | head -n 1
+          pkg-config --modversion icu-uc
       # Only the API package ("app") and its dev tools. The tests don't need the
       # worker's torch/opencv: the worker loop is tested with a fake pipeline.
       # --locked fails if uv.lock is out of date with pyproject.toml.
       - name: Install Python dependencies (API only, no torch)
         timeout-minutes: 5
         run: uv sync --locked --package app
-      # The video endpoints use ffprobe/ffmpeg, and the tests make sample videos
-      # with it. A stalled package mirror once hung this step for 10 minutes:
-      # apt now gives up on a stuck download after 30 s and retries.
-      # libfribidi0: Pillow's complex text layout (Thai captions in reel exports)
-      - name: Install ffmpeg
-        timeout-minutes: 5
-        run: |
-          APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
-          sudo apt-get $APT_OPTS update
-          sudo apt-get $APT_OPTS install -y --no-install-recommends ffmpeg libfribidi0
-          ffprobe -version | head -n 1
       # .env is gitignored; the example's development defaults are fine for CI
       - timeout-minutes: 1
         run: cp .env.example .env
